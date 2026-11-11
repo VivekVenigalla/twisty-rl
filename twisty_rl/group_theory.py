@@ -500,11 +500,13 @@ class PuzzleGroup:
     of anchor positions, and every reachable state is ``v[T_k]`` with ``v`` in the vertex group.
     """
 
-    def __init__(self, puzzle: Puzzle, seed: int = 0, deterministic: bool = True):
+    def __init__(self, puzzle: Puzzle, seed: int = 0, deterministic: bool = True,
+                 base_order: Optional[Sequence[int]] = None):
         self.puzzle = puzzle
         self.n = puzzle.n
         self.color = puzzle.solved_colors
-        pref = self._base_preference()
+        pref = list(base_order or []) + self._base_preference()
+        pref = list(dict.fromkeys(pref))
         if puzzle.is_group:
             self.anchor_paths: dict[int, np.ndarray] = {0: puzzle.identity}
             self.anchor_words: dict[int, tuple[int, ...]] = {0: ()}
@@ -780,8 +782,6 @@ class MacroMiner:
             pa = np.stack([self._eval(w) for w in words_a])
             pb = np.stack([self._eval(w) for w in words_b])
             pa_inv, pb_inv = np.argsort(pa, axis=1), np.argsort(pb, axis=1)
-            found: list[tuple[int, int, int]] = []
-            sup_hist: dict[int, int] = {}
             rows = []
             for i in range(len(words_a)):
                 t = pa[i][pb]                                  # A then B
@@ -802,7 +802,6 @@ class MacroMiner:
                 word = A + B + self._inverse_word(A) + self._inverse_word(B)
                 perm = pa[i][pb[j]][pa_inv[i]][pb_inv[j]]
                 self._record(pool, word, perm, "commutator")
-            del found, sup_hist
         else:
             for A in words_a:
                 for B in words_b:
