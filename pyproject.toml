@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "twisty-rl"
+version = "0.1.0"
+description = "Topology-agnostic RL, computational group theory and heuristic search for permutation puzzles"
+requires-python = ">=3.11"
+dependencies = ["torch>=2.2", "numpy>=1.26", "gymnasium>=0.29", "textual>=0.60", "rich>=13", "pydantic>=2.5"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+twisty = "main:main"
+
+[tool.setuptools]
+packages = ["twisty_rl"]
+py-modules = ["main"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+filterwarnings = ["error::UserWarning:twisty_rl"]
