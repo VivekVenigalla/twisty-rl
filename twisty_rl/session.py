@@ -47,6 +47,10 @@ class Session:
         self.spin = True
         self.spin_speed = 0.6
         self._spin_t0 = time.monotonic()
+        # look of the 3D view: anti-aliasing level, known background colour, cell height / width
+        self.quality = 3
+        self.background: Optional[tuple[int, int, int]] = None
+        self.cell_aspect = 2.0
         # timed move playback (smooth layer turns for clients that only poll frames)
         self._play_queue: deque[tuple[str, float]] = deque()
         self._play_current: Optional[tuple[str, float]] = None
@@ -473,6 +477,28 @@ class Session:
         self._spin_t0 = time.monotonic()
         self.pitch = float(np.clip(self.pitch + dpitch, -1.5, 1.5))
 
+    def set_style(self, bg: Optional[str] = None, aspect: Optional[float] = None, quality: Optional[int] = None,
+                  pitch: Optional[float] = None, zoom: Optional[float] = None) -> dict:
+        """Tune the 3D view.  ``bg`` is ``"#rrggbb"`` (``""`` or ``"none"`` forgets it)."""
+        if bg is not None:
+            text = bg.strip().lstrip("#").lower()
+            if text in ("", "none"):
+                self.background = None
+            elif len(text) == 6 and all(ch in "0123456789abcdef" for ch in text):
+                self.background = (int(text[0:2], 16), int(text[2:4], 16), int(text[4:6], 16))
+            else:
+                raise ValueError(f"background must look like #rrggbb, got {bg!r}")
+        if aspect is not None:
+            self.cell_aspect = float(np.clip(float(aspect), 1.0, 4.0))
+        if quality is not None:
+            self.quality = int(np.clip(int(quality), 1, 6))
+        if pitch is not None:
+            self.pitch = float(np.clip(float(pitch), -1.5, 1.5))
+        if zoom is not None:
+            self.zoom = float(np.clip(float(zoom), 0.3, 3.0))
+        return dict(bg=None if self.background is None else "#%02x%02x%02x" % self.background,
+                    aspect=self.cell_aspect, quality=self.quality, pitch=self.pitch, zoom=self.zoom)
+
     def set_spin(self, on: bool) -> None:
         self.yaw = self.camera_yaw()
         self._spin_t0 = time.monotonic()
@@ -488,7 +514,8 @@ class Session:
         st = self.state if state is None else state
         if view == "net":
             return r.render_net(st, width, height)
-        return r.render_3d(st, width, height, yaw=self.camera_yaw(), pitch=self.pitch, zoom=self.zoom, anim=anim)
+        return r.render_3d(st, width, height, yaw=self.camera_yaw(), pitch=self.pitch, zoom=self.zoom, anim=anim,
+                           supersample=self.quality, bg=self.background, cell_aspect=self.cell_aspect)
 
     def status(self) -> dict:
         res = self.last_result

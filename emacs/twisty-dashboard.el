@@ -107,6 +107,20 @@ per day."
   "Rotation speed of the camera in radians per second."
   :type 'number)
 
+(defcustom twisty-cell-aspect 2.0
+  "Height of one character cell divided by its width.
+Terminal.app with a 12 pt font is about 2.15; a wrong value makes the
+puzzle look squashed or stretched."
+  :type 'number)
+
+(defcustom twisty-render-quality 3
+  "Anti-aliasing level of the 3D view (1 = none, 3 = smooth, up to 6)."
+  :type 'integer)
+
+(defcustom twisty-camera-pitch 0.55
+  "Camera tilt in radians; larger values look down onto the top face."
+  :type 'number)
+
 (defcustom twisty-frame-size '(46 . 23)
   "Size (COLUMNS . ROWS) of the 3D view in the dashboard buffer."
   :type '(cons integer integer))
@@ -453,7 +467,15 @@ CALLBACK, if given, is called with (RESULT ERROR).  Return the request id."
     (twisty--send "show" `((mode . ,(symbol-name twisty-show)) (depth . ,twisty-show-depth)
                            (pause . ,twisty-show-pause) (move_time . ,twisty-move-time))
                   nil)
-    (twisty--send "spin" `((on . t) (speed . ,twisty-spin-speed)) nil)))
+    (twisty--send "spin" `((on . t) (speed . ,twisty-spin-speed)) nil)
+    ;; blend the edges into the real background so no glyph has to line up with the cell
+    (let ((bg (face-background 'default nil t)))
+      (twisty--send "style"
+                    `((bg . ,(if (and (stringp bg) (string-match-p "\\`#[0-9a-fA-F]\\{6\\}\\'" bg))
+                                 bg "none"))
+                      (aspect . ,twisty-cell-aspect) (quality . ,twisty-render-quality)
+                      (pitch . ,twisty-camera-pitch))
+                    nil))))
 
 ;;;###autoload
 (defun twisty-dashboard-attach (&optional buffer)

@@ -23,8 +23,9 @@ from .geometry import euler_matrix, halfspace_faces, normalize, polygon_centroid
 from .schema import Puzzle
 
 UPPER, LOWER = "▀", "▄"
-BODY_COLOR = np.array([26, 26, 30], dtype=np.float64)
-LIGHT_DIR = normalize((0.35, 0.65, 0.68))
+BODY_COLOR = np.array([14, 14, 17], dtype=np.float64)
+LIGHT_DIR = normalize((0.30, 0.78, 0.55))
+AMBIENT = 0.64                      # stickers stay recognisably their own colour on every face
 
 
 # ----------------------------------------------------------------------------------
@@ -126,13 +127,19 @@ class Frame:
 # Rasteriser
 # ----------------------------------------------------------------------------------
 class Rasterizer:
-    """Z-buffered triangle rasteriser on a ``width x 2*height`` pixel grid."""
+    """Z-buffered triangle rasteriser on a ``width x 2*height`` pixel grid.
 
-    def __init__(self, width: int, height: int):
+    ``supersample = s`` rasterises ``s x s`` samples per pixel (``pw x ph`` samples in total) and
+    :meth:`frame` box-filters them down, which anti-aliases every edge.
+    """
+
+    def __init__(self, width: int, height: int, supersample: int = 1):
         self.width, self.height = max(int(width), 1), max(int(height), 1)
         self.h2 = 2 * self.height
-        self.color = np.zeros((self.h2, self.width, 3), dtype=np.uint8)
-        self.depth = np.full((self.h2, self.width), np.inf)
+        self.ss = max(1, min(int(supersample), 8))
+        self.pw, self.ph = self.width * self.ss, self.h2 * self.ss
+        self.color = np.zeros((self.ph, self.pw, 3), dtype=np.uint8)
+        self.depth = np.full((self.ph, self.pw), np.inf)
 
     def clear(self) -> None:
         self.color.fill(0)
@@ -141,9 +148,9 @@ class Rasterizer:
     def triangle(self, p: np.ndarray, z: np.ndarray, rgb: np.ndarray) -> None:
         """``p [3, 2]`` pixel coordinates, ``z [3]`` depths (smaller is nearer)."""
         x0 = max(int(math.floor(p[:, 0].min())), 0)
-        x1 = min(int(math.ceil(p[:, 0].max())), self.width - 1)
+        x1 = min(int(math.ceil(p[:, 0].max())), self.pw - 1)
         y0 = max(int(math.floor(p[:, 1].min())), 0)
-        y1 = min(int(math.ceil(p[:, 1].max())), self.h2 - 1)
+        y1 = min(int(math.ceil(p[:, 1].max())), self.ph - 1)
         if x0 > x1 or y0 > y1:
             return
         area = (p[1, 0] - p[0, 0]) * (p[2, 1] - p[0, 1]) - (p[1, 1] - p[0, 1]) * (p[2, 0] - p[0, 0])
@@ -165,8 +172,28 @@ class Rasterizer:
         for i in range(1, len(p) - 1):
             self.triangle(p[[0, i, i + 1]], z[[0, i, i + 1]], rgb)
 
-    def frame(self) -> Frame:
-        return Frame(self.color.copy(), np.isfinite(self.depth))
+    def frame(self, bg: Optional[tuple[int, int, int]] = None) -> Frame:
+        """Resolve the sample buffer into a frame.
+
+        With ``bg`` the image is composited over that colour, so silhouettes are anti-aliased too
+        and every cell is fully specified (only ``▀`` and blanks are needed -- nothing depends on how
+        a font draws ``▄``).  Without it, pixels at least half covered are kept.
+        """
+        covered = np.isfinite(self.depth)
+        s = self.ss
+        if s == 1 and bg is None:
+            return Frame(self.color.copy(), covered)
+        acc = (self.color.astype(np.float64) * covered[..., None]).reshape(self.h2, s, self.width, s, 3).sum((1, 3))
+        cnt = covered.reshape(self.h2, s, self.width, s).sum((1, 3)).astype(np.float64)
+        if bg is not None:
+            out = (acc + (s * s - cnt)[..., None] * np.asarray(bg, dtype=np.float64)) / (s * s)
+            mask = np.ones((self.h2, self.width), dtype=bool)
+        else:
+            out = acc / np.maximum(cnt, 1.0)[..., None]
+            mask = cnt >= (s * s) / 2.0
+        # a small colour lattice keeps runs long and the number of distinct terminal faces bounded
+        out = np.clip(np.round(out / 6.0) * 6.0, 0, 255).astype(np.uint8)
+        return Frame(out, mask)
 
 
 # ----------------------------------------------------------------------------------
@@ -199,19 +226,26 @@ SOLID_PALETTES = {
 }
 
 
-def _project(pts: np.ndarray, width: int, h2: int, zoom: float, distance: float) -> tuple[np.ndarray, np.ndarray]:
+def _project(pts: np.ndarray, width: int, h2: int, zoom: float, distance: float,
+             cell_aspect: float = 2.0) -> tuple[np.ndarray, np.ndarray]:
+    """Perspective projection onto a ``width x h2`` sample grid.
+
+    ``cell_aspect`` is the height / width of a terminal cell; a half-block pixel is therefore
+    ``cell_aspect / 2`` times taller than wide and the vertical scale compensates for it.
+    """
     depth = distance - pts[:, 2]
     f = distance * 0.92
-    scale = 0.5 * min(width, h2) * zoom
+    tall = max(cell_aspect, 0.5) / 2.0
+    scale = 0.5 * min(width, h2 * tall) * zoom
     sx = width / 2 + pts[:, 0] * f / depth * scale
-    sy = h2 / 2 - pts[:, 1] * f / depth * scale
+    sy = h2 / 2 - pts[:, 1] * f / depth * scale / tall
     return np.stack([sx, sy], axis=1), depth
 
 
 def _shade(rgb: np.ndarray, normal_cam: np.ndarray, double_sided: bool) -> np.ndarray:
     lam = float(normal_cam @ LIGHT_DIR)
     lam = abs(lam) if double_sided else max(lam, 0.0)
-    return np.clip(rgb * (0.42 + 0.58 * lam), 0, 255).astype(np.uint8)
+    return np.clip(rgb * (AMBIENT + (1.0 - AMBIENT) * lam), 0, 255).astype(np.uint8)
 
 
 def render_solid(kind: str, width: int = 40, height: int = 20, yaw: float = 0.6, pitch: float = 0.45,
@@ -235,7 +269,7 @@ def render_solid(kind: str, width: int = 40, height: int = 20, yaw: float = 0.6,
 class PuzzleRenderer:
     """Cached mesh of one puzzle; renders arbitrary states in 3D and as a 2D net."""
 
-    def __init__(self, puzzle: Puzzle, inset: float = 0.86):
+    def __init__(self, puzzle: Puzzle, inset: float = 0.88):
         self.puzzle = puzzle
         geom = puzzle.spec.geometry
         if geom is None:
@@ -271,11 +305,16 @@ class PuzzleRenderer:
     # -- 3D ---------------------------------------------------------------------------------
     def render_3d(self, P: np.ndarray, width: int = 48, height: int = 24, yaw: float = 0.6, pitch: float = 0.45,
                   roll: float = 0.0, zoom: float = 1.0, distance: float = 4.2,
-                  anim: Optional[tuple[str, float]] = None) -> Frame:
-        """Render permutation state ``P``.  ``anim=(move_name, t)`` shows that move ``t`` of the way through."""
+                  anim: Optional[tuple[str, float]] = None, supersample: int = 1,
+                  bg: Optional[tuple[int, int, int]] = None, cell_aspect: float = 2.0) -> Frame:
+        """Render permutation state ``P``.  ``anim=(move_name, t)`` shows that move ``t`` of the way through.
+
+        ``supersample`` anti-aliases, ``bg`` composites over a known background colour and
+        ``cell_aspect`` corrects for terminal cells that are not exactly twice as tall as wide.
+        """
         colors = self.palette[self.puzzle.solved_colors[np.asarray(P)]]
         R = euler_matrix(yaw, pitch, roll)
-        ras = Rasterizer(width, height)
+        ras = Rasterizer(width, height, supersample)
         cam = np.array([0.0, 0.0, distance])
         zoom = zoom * self.base_zoom
         moving: set[int] = set()
@@ -289,7 +328,7 @@ class PuzzleRenderer:
             n = normalize(np.cross(pts[1] - pts[0], pts[2] - pts[0]))
             if not self.double_sided and n @ (cam - pts[0]) <= 0:
                 continue
-            scr, depth = _project(pts, ras.width, ras.h2, zoom, distance)
+            scr, depth = _project(pts, ras.pw, ras.ph, zoom, distance, cell_aspect)
             ras.polygon(scr, depth + (0.06 if self.double_sided else 0.0), _shade(BODY_COLOR, n, self.double_sided))
         for i, poly in enumerate(self.polys):
             M = Rm if i in moving else R
@@ -297,9 +336,9 @@ class PuzzleRenderer:
             n = M @ self.normals[i]
             if not self.double_sided and n @ (cam - pts[0]) <= 0:
                 continue
-            scr, depth = _project(pts, ras.width, ras.h2, zoom, distance)
+            scr, depth = _project(pts, ras.pw, ras.ph, zoom, distance, cell_aspect)
             ras.polygon(scr, depth, _shade(colors[i], n, self.double_sided))
-        return ras.frame()
+        return ras.frame(bg)
 
     # -- 2D net ---------------------------------------------------------------------------------
     def render_net(self, P: np.ndarray, width: int = 60, height: int = 20, labels: bool = True) -> Frame:

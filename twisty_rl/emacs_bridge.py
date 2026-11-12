@@ -119,6 +119,14 @@ class TwistyDaemon:
         self.session.zoom = min(3.0, max(0.3, self.session.zoom * float(zoom)))
         return {"yaw": self.session.camera_yaw(), "pitch": self.session.pitch, "zoom": self.session.zoom}
 
+    def rpc_style(self, bg: Optional[str] = None, aspect: Optional[float] = None, quality: Optional[int] = None,
+                  pitch: Optional[float] = None, zoom: Optional[float] = None) -> dict:
+        """Look of the 3D view: background colour to blend into, cell aspect, anti-aliasing, camera."""
+        try:
+            return self.session.set_style(bg, aspect, quality, pitch, zoom)
+        except ValueError as exc:
+            raise RpcError(-32602, str(exc)) from None
+
     def rpc_spin(self, on: Optional[bool] = None, speed: Optional[float] = None) -> dict:
         if speed is not None:
             self.session.set_spin(self.session.spin)
