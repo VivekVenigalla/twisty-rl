@@ -91,6 +91,11 @@ engine solve it in an endless loop, `daily' shows one fixed scramble
 per day."
   :type '(choice (const spin) (const attract) (const daily)))
 
+(defcustom twisty-show-carousel nil
+  "Puzzle names the `attract' show rotates through, one per round.
+nil stays on the current puzzle."
+  :type '(repeat string))
+
 (defcustom twisty-show-depth 9
   "Number of scramble moves per round of the `attract' show."
   :type 'integer)
@@ -387,6 +392,9 @@ CALLBACK, if given, is called with (RESULT ERROR).  Return the request id."
 (defvar twisty--corner-overlays nil "Widget overlays, in painting order.")
 (defvar twisty--corner-key nil "Layout the current overlays were built for.")
 (defvar twisty--corner-layout nil "(INLINE-ROWS . EOB-AT-BOL) of the current overlays.")
+(defvar twisty--status)
+(defvar twisty-widget-top-margin 0 "Blank rows painted above the widget.")
+(defvar twisty--widget-stack nil "Saved widget placements (see `twisty-widget-push').")
 (defvar twisty--timer nil)
 (defvar twisty--pending nil "Non-nil while a dashboard request is in flight.")
 (defvar twisty--pending-since 0.0)
@@ -448,9 +456,10 @@ CALLBACK, if given, is called with (RESULT ERROR).  Return the request id."
   "Paint LINES (and CAPTION) as the widget of `twisty--corner-buffer'."
   (when (buffer-live-p twisty--corner-buffer)
     (with-current-buffer twisty--corner-buffer
-      (let* ((lines (if twisty-widget-caption
-                        (append lines (twisty--caption-lines caption (car twisty-corner-size)))
-                      lines))
+      (let* ((lines (append (make-list (max 0 twisty-widget-top-margin) "")
+                            lines
+                            (and twisty-widget-caption
+                                 (twisty--caption-lines caption (car twisty-corner-size)))))
              (win (get-buffer-window (current-buffer) t))
              (start (if win (window-start win) (point-min)))
              (key (list start (buffer-chars-modified-tick) (length lines) twisty-widget-position)))
@@ -465,7 +474,8 @@ CALLBACK, if given, is called with (RESULT ERROR).  Return the request id."
   (interactive)
   (when (twisty--live-p)
     (twisty--send "show" `((mode . ,(symbol-name twisty-show)) (depth . ,twisty-show-depth)
-                           (pause . ,twisty-show-pause) (move_time . ,twisty-move-time))
+                           (pause . ,twisty-show-pause) (move_time . ,twisty-move-time)
+                           (carousel . ,(vconcat twisty-show-carousel)))
                   nil)
     (twisty--send "spin" `((on . t) (speed . ,twisty-spin-speed)) nil)
     ;; blend the edges into the real background so no glyph has to line up with the cell
@@ -495,6 +505,45 @@ The daemon is contacted in the background, so this never blocks."
   (when (buffer-live-p twisty--corner-buffer)
     (with-current-buffer twisty--corner-buffer (twisty--corner-clear)))
   (setq twisty--corner-buffer nil))
+
+(defun twisty-widget-push (buffer &rest props)
+  "Move the widget to BUFFER, remembering where it was.
+PROPS may set :size, :position, :caption, :show, :carousel and :margin
+for the new placement.  `twisty-widget-pop' undoes it, including the
+puzzle that was showing."
+  (push (list :buffer twisty--corner-buffer :size twisty-corner-size
+              :position twisty-widget-position :caption twisty-widget-caption
+              :show twisty-show :carousel twisty-show-carousel
+              :margin twisty-widget-top-margin
+              :puzzle (alist-get 'puzzle twisty--status))
+        twisty--widget-stack)
+  (when (plist-member props :size) (setq twisty-corner-size (plist-get props :size)))
+  (when (plist-member props :position) (setq twisty-widget-position (plist-get props :position)))
+  (when (plist-member props :caption) (setq twisty-widget-caption (plist-get props :caption)))
+  (when (plist-member props :show) (setq twisty-show (plist-get props :show)))
+  (when (plist-member props :carousel) (setq twisty-show-carousel (plist-get props :carousel)))
+  (setq twisty-widget-top-margin (or (plist-get props :margin) 0))
+  (twisty-dashboard-attach buffer))
+
+(defun twisty-widget-pop ()
+  "Return the widget to where it was before the last `twisty-widget-push'."
+  (let ((saved (pop twisty--widget-stack)))
+    (when saved
+      (setq twisty-corner-size (plist-get saved :size)
+            twisty-widget-position (plist-get saved :position)
+            twisty-widget-caption (plist-get saved :caption)
+            twisty-show (plist-get saved :show)
+            twisty-show-carousel (plist-get saved :carousel)
+            twisty-widget-top-margin (plist-get saved :margin))
+      (if (buffer-live-p (plist-get saved :buffer))
+          (twisty-dashboard-attach (plist-get saved :buffer))
+        (twisty-dashboard-detach))
+      (when (twisty--live-p)
+        (let ((puzzle (plist-get saved :puzzle)))
+          (if (and puzzle (not (equal puzzle (alist-get 'puzzle twisty--status))))
+              (twisty--send "set_puzzle" `((name . ,puzzle))
+                            (lambda (_r _e) (twisty-sync-options)))
+            (twisty-sync-options)))))))
 
 ;;;; Dashboard buffer ----------------------------------------------------------------------------
 

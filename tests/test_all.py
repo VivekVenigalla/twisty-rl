@@ -988,16 +988,23 @@ def test_json_rpc_daemon(daemon):
 
 @pytest.mark.skipif(shutil.which("emacs") is None, reason="emacs not installed")
 def test_emacs_client_byte_compiles_and_talks_to_daemon(daemon, tmp_path):
-    src = ROOT / "emacs" / "twisty-dashboard.el"
-    copy = tmp_path / "twisty-dashboard.el"
-    shutil.copy(src, copy)
-    comp = subprocess.run(["emacs", "--batch", "-Q", "--eval", "(setq byte-compile-error-on-warn t)",
-                           "-f", "batch-byte-compile", str(copy)], capture_output=True, text=True, timeout=120)
+    for src in (ROOT / "emacs").glob("*.el"):
+        shutil.copy(src, tmp_path / src.name)
+    files = sorted(str(p) for p in tmp_path.glob("*.el"))
+    comp = subprocess.run(["emacs", "--batch", "-Q", "-L", str(tmp_path), "--eval", "(setq byte-compile-error-on-warn t)",
+                           "-f", "batch-byte-compile", *files], capture_output=True, text=True, timeout=180)
     assert comp.returncode == 0, comp.stderr
     env = dict(os.environ, TWISTY_SOCKET=daemon.socket_path)
-    run = subprocess.run(["emacs", "--batch", "-Q", "-l", str(src), "-f", "twisty-dashboard-self-test"],
-                         capture_output=True, text=True, timeout=180, env=env)
-    assert run.returncode == 0 and "TWISTY-EMACS-OK" in run.stdout, run.stderr[-2000:]
+    for lib, marker in (("twisty-dashboard", "TWISTY-EMACS-OK"), ("twisty-paint", "TWISTY-PAINT-OK"),
+                        ("twisty-timer", "TWISTY-TIMER-OK"), ("twisty-saver", "TWISTY-SAVER-OK")):
+        run = subprocess.run(["emacs", "--batch", "-Q", "-L", str(ROOT / "emacs"), "-l", lib,
+                              "-f", lib.replace("-dashboard", "-dashboard") + "-self-test"],
+                             capture_output=True, text=True, timeout=240, env=env)
+        assert run.returncode == 0 and marker in run.stdout, (lib, run.stderr[-2500:])
+    with BridgeClient(daemon.socket_path) as c:            # leave the shared daemon as the other tests expect it
+        c.call("set_puzzle", name="cube3")
+        c.call("show", mode="spin", carousel=[])
+        c.call("style", bg="none", quality=4)
 
 
 def test_cli_entry_points(capsys):

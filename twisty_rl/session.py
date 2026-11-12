@@ -255,7 +255,8 @@ class Session:
         if len(set(letters)) != len(letters):
             letters = list("123456789abcdefghijklmnoprstuvwxyz"[: len(palette)])
         return dict(puzzle=pz.name, rows=int(max(r for r, _ in out)) + 1, cols=int(max(c for _, c in out)) + 1,
-                    cells=out, colors=self.colors(), fixed=fixed.tolist(), keys=letters,
+                    cells=out, colors=self.colors(), solved=pz.solved_colors.tolist(),
+                    fixed=fixed.tolist(), keys=letters,
                     palette=["#%02x%02x%02x" % c for c in palette], names=list(pz.spec.color_names[: pz.num_colors]),
                     need=np.bincount(pz.solved_colors, minlength=pz.num_colors).tolist())
 
