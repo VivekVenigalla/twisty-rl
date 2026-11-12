@@ -1242,7 +1242,7 @@ def test_word_reduction_and_notation():
         w = rng.integers(0, pz.num_primitive, size=30).tolist()
         r = pz.reduce_word(w)
         assert len(r) <= len(w) and np.array_equal(pz.apply_word(pz.identity, w), pz.apply_word(pz.identity, r))
-    assert pz.format_moves([U, U, R, Ri, Ri, D]) == ["U2", "R", "R2'", "D"]
+    assert pz.format_moves([U, U, R, Ri, Ri, D]) == ["U2", "R", "R2", "D"]
     assert pz.parse_moves("U2 R R2' D") == [U, U, R, Ri, Ri, D]
     fz = get_puzzle("fifteen")
     u, d, l = fz.action_index("U"), fz.action_index("D"), fz.action_index("L")

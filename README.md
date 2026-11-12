@@ -38,9 +38,14 @@ Other entry points: `list`, `info <puzzle>`, `solve <puzzle> --scramble N`, `min
 | `env.py` | `TensorPuzzle` / `VecPuzzleEnv` (batched gather transitions on mps / cuda / cpu) and Gymnasium wrappers |
 | `graph_compiler.py`, `model.py` | multi-relational graph with LapPE / RWPE / diffusion kernels; relational graph transformer with distributional value head and edge-pooled policy head |
 | `train.py`, `adversarial.py` | distributional ADI with bound-projected Bellman targets, multi-task loader, macro promotion; PAIRED-style scrambler / solver self-play |
+| `chain_solver.py` | always-terminating solver: short-word factorisation through the stabiliser chain (Minkwitz-style), cached on disk |
 | `search.py` | Zobrist hashing with symmetry canonicalisation, tensor transposition table, stabiliser-chain pattern databases, batch weighted A*, batched beam search |
 | `renderer_3d.py`, `tui.py` | z-buffered half-block rasteriser, universal net view, Textual dashboard |
-| `session.py`, `emacs_bridge.py`, `emacs/twisty-dashboard.el` | shared session, JSON-RPC daemon on a Unix socket, Emacs corner widget and interactive mode |
+| `session.py`, `emacs_bridge.py` | shared session (solve, timed playback, idle shows, carousel, paint layout) and the JSON-RPC daemon on a Unix socket |
+| `emacs/twisty-dashboard.el` | connection, live widget (push / pop between buffers), interactive mode |
+| `emacs/twisty-paint.el` | enter a physical puzzle on its net, get the defect explained or a solution to step through |
+| `emacs/twisty-timer.el` | speedcubing timer: scramble on the puzzle, inspection, ao5 / ao12, +2 / DNF |
+| `emacs/twisty-saver.el` | idle screensaver that rotates through puzzles |
 
 ### Conventions
 
@@ -59,6 +64,11 @@ database goals, solvability).
 - **Equivariance.** No parameter is indexed by facet, colour or action. With LapPE masked the
   network is exactly invariant to facet relabelling and equivariant to action reordering (tested
   to 1e-6). LapPE itself is sign-invariant but not basis-invariant in degenerate eigenspaces.
+- **Every state gets solved.** `solve` searches for an optimal answer for a couple of seconds and
+  then falls back to the chain solver, which always finishes but is far from optimal (about 90
+  quarter turns on a random 3x3, several hundred on a 4x4 or Megaminx).
+- **Impossible colourings are explained.** `diagnose_colors` reports a flipped edge, a twisted
+  corner, swapped pieces or a mirrored piece instead of just "unsolvable".
 - **Optimality.** `BatchedWeightedAStar(optimal=True)` with weight 1 and a pattern-database
   heuristic proves optimality; the tests compare it against exhaustive BFS.
 - **Macros** cost the length of their word, so they shorten search depth without changing
@@ -85,9 +95,9 @@ The daemon is started on demand from the project's `.venv`.
 
 ## Limits
 
-- Without a trained checkpoint, solving uses pattern databases only. That is optimal and fast for
-  the small puzzles and shallow scrambles of the large ones, but it will not solve a fully
-  scrambled 3x3, 4x4 or Megaminx; those need a trained model (`train`, then `solve --checkpoint`).
+- Without a trained checkpoint, *short* solutions come from pattern databases only: optimal for
+  the small puzzles and for shallow scrambles of the large ones. Deeper states are still solved,
+  by the chain solver, but with long solutions; short ones there need a trained model.
 - `bench` and the tests demonstrate convergence at micro scale (minutes), not a fully trained
   solver for the large puzzles.
 - Macro mining is exhaustive over short words; the Megaminx takes a few seconds.

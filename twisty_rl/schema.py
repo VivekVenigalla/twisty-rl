@@ -515,10 +515,19 @@ class Puzzle:
             while j + 1 < len(names) and names[j + 1] == names[i]:
                 j += 1
             count, name = j - i + 1, names[i]
+            half = False                               # X2' is the same turn as X2 when X has order 4
+            if count > 1 and self.is_group and name in self._name_to_action:
+                perm = self.table[self._name_to_action[name], 0]
+                q = perm
+                for _ in range(2 * count - 1):
+                    q = q[perm]
+                half = bool(np.array_equal(q, self.identity))
             if count == 1:
                 out.append(name)
-            elif name.endswith("'"):
+            elif name.endswith("'") and not half:
                 out.append(f"{name[:-1]}{count}'")
+            elif name.endswith("'"):
+                out.append(f"{name[:-1]}{count}")
             else:
                 out.append(f"{name}{count}")
             i = j + 1

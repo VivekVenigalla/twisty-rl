@@ -66,7 +66,7 @@ class Session:
         self.show_depth = 9
         self.show_daily_depth = 20
         self.show_pause = 2.5
-        self.show_time_limit = 6.0
+        self.show_time_limit = 1.5
         self.show_caption = ""
         self._show_phase = "pause"
         self._show_until = 0.0
@@ -76,7 +76,7 @@ class Session:
         self.show_carousel: list[str] = []
         self._show_rounds = 0
         self.show_max_play = 30.0           # seconds a long (chain-solver) solution may take to play back
-        self.astar_patience = 3.0           # seconds "auto" searches for an optimal answer before falling back
+        self.astar_patience = 2.0           # seconds "auto" searches for an optimal answer before falling back
         # heavy per-puzzle objects survive puzzle switches (carousel, coming back to a puzzle)
         self._per_puzzle: dict[str, dict] = {}
         self._build_lock = threading.Lock()
@@ -196,7 +196,9 @@ class Session:
         with self._lock:
             self._clear_play()
             rng = self.rng if seed is None else np.random.default_rng(seed)
-            self.state, actions = self.puzzle.scramble(rng, depth)
+            _, actions = self.puzzle.scramble(rng, depth)
+            actions = self.puzzle.reduce_word(actions)       # no "D U D'": every move of the scramble counts
+            self.state = self.puzzle.apply_word(self.puzzle.identity, actions)
             self.history.clear()
             self.scramble_moves = self.puzzle.names_of(actions)
             return self.scramble_moves
@@ -557,7 +559,7 @@ class Session:
                 self._clear_play()
                 self.state = self.puzzle.identity.copy()
                 _, actions = self.puzzle.scramble(self.rng, self.show_depth)
-                names = self.puzzle.names_of(actions)
+                names = self.puzzle.names_of(self.puzzle.reduce_word(actions))
                 self.history.clear()
                 self.scramble_moves = self._show_scramble = names
                 self._play_queue.extend((n, max(self.move_time * 0.55, 0.01)) for n in names)
@@ -585,16 +587,22 @@ class Session:
             with self._lock:
                 if self._show_phase != "solving" or self.show_paused:
                     return
-                if res is not None and res.solved:
+                inv = self.puzzle.inverse
+                undo = self.puzzle.names_of(
+                    [int(inv[self.puzzle.action_index(n)]) for n in reversed(self._show_scramble)])
+                if res is not None and res.solved and not res.optimal_proven and len(res.moves) > 3 * len(undo):
+                    # a correct but very long chain solution is no fun to watch for a short scramble
+                    moves = undo
+                    self.show_caption = (f"no short solution found in time (the chain solver needs {len(res.moves)} "
+                                         f"moves), undoing the scramble: " + " ".join(self.base_puzzle.format_moves(moves)))
+                elif res is not None and res.solved:
                     moves = res.moves
                     text = " ".join(self.base_puzzle.format_moves(moves))
                     self.show_caption = (
                         f"solved in {len(moves)} moves (optimal): {text}  ·  {res.nodes_generated:,} nodes in {res.elapsed:.2f}s"
                         if res.optimal_proven else f"solved in {len(moves)} moves (chain solver): {text}")
                 else:
-                    inv = self.puzzle.inverse
-                    moves = self.puzzle.names_of(
-                        [int(inv[self.puzzle.action_index(n)]) for n in reversed(self._show_scramble)])
+                    moves = undo
                     self.show_caption = "search budget exceeded, undoing the scramble: " + " ".join(moves)
                 dur = max(0.04, min(self.move_time, self.show_max_play / max(len(moves), 1)))
                 self._play_queue.extend((n, dur) for n in moves)
