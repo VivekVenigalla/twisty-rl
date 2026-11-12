@@ -1026,3 +1026,106 @@ def test_registry_names_are_stable_and_session_cycles_all_puzzles():
         if s.history or s.scramble_moves:
             s.reset()
             assert s.is_solved()
+
+
+def test_timed_playback_and_idle_shows():
+    import time as _time
+    s = Session("cube3", device="cpu")
+    assert s.play("R U R' U'", move_time=0.02) == ["R", "U", "R'", "U'"]
+    assert s.playing and s.is_solved()                       # nothing applied until frames are rendered
+    mid = None
+    t0 = _time.monotonic()
+    while s.playing and _time.monotonic() - t0 < 5:
+        a = s._advance_play(_time.monotonic())
+        mid = mid or a
+        _time.sleep(0.002)
+    assert mid is not None and mid[0] == "R" and 0.0 <= mid[1] < 1.0
+    assert s.history == ["R", "U", "R'", "U'"] and not s.is_solved()
+    s.play("U R U' R'")
+    s.apply("F")                                             # a manual move flushes the queue first
+    assert s.history[-5:] == ["U", "R", "U'", "R'", "F"] and not s.playing
+    with pytest.raises(KeyError):
+        s.play("Q9")
+    with pytest.raises(ValueError):
+        s.set_show("disco")
+    # attract mode: scramble -> search -> animated solution -> pause, forever
+    s.reset()
+    st = s.set_show("attract", depth=5, pause=0.05, move_time=0.01)
+    assert st["mode"] == "attract" and not st["paused"]
+    phases, solved_after_play = [], []
+    t0 = _time.monotonic()
+    while _time.monotonic() - t0 < 20 and phases.count("pause") < 3:
+        s.render(16, 8)
+        ph = s.show_status()["phase"]
+        if not phases or phases[-1] != ph:
+            if ph == "pause" and phases and phases[-1] == "playing":
+                solved_after_play.append(s.is_solved())
+            phases.append(ph)
+        _time.sleep(0.002)
+    assert phases[:5] == ["pause", "scrambling", "solving", "playing", "pause"]
+    assert solved_after_play and all(solved_after_play)
+    assert "solved in" in s.show_caption and "optimal" in s.show_caption
+    s.pause_show()
+    frozen = s.show_status()["phase"]
+    for _ in range(20):
+        s.render(16, 8)
+    assert s.show_status()["phase"] == frozen and s.show_status()["paused"]
+    # scramble of the day is reproducible and seeded by the date
+    a = s.set_show("daily")["caption"]
+    state_a = s.state.copy()
+    s.reset()
+    s.set_show("spin")
+    b = s.set_show("daily")["caption"]
+    assert a == b and a.startswith("scramble of the day") and np.array_equal(state_a, s.state)
+    assert s.scramble(8, seed=7) == s.scramble(8, seed=7) != s.scramble(8, seed=8)
+    assert s.status()["show"]["mode"] == "daily"
+
+
+def test_daemon_show_play_and_parent_watchdog(daemon, tmp_path):
+    with BridgeClient(daemon.socket_path) as c:
+        c.call("set_puzzle", name="cube2")
+        assert c.call("play", moves="R U", move_time=0.01)["queued"] == ["R", "U"]
+        for _ in range(200):
+            if c.call("dashboard", width=12, height=6)["status"]["moves"] == 2:
+                break
+        assert c.call("status")["history"] == ["R", "U"]
+        assert c.call("show", mode="attract", depth=3, pause=0.05, move_time=0.01)["mode"] == "attract"
+        c.call("apply", moves="F")                            # a human move pauses the show
+        assert c.call("status")["show"]["paused"] is True
+        with pytest.raises(RpcError):
+            c.call("show", mode="nope")
+        c.call("show", mode="spin")
+        c.call("set_puzzle", name="cube3")
+    # --exit-with-parent: the daemon dies with the process that launched it
+    sock = os.path.join(tempfile.mkdtemp(prefix="tw-"), "w.sock")      # AF_UNIX paths must stay short
+    launcher = subprocess.Popen(
+        [sys.executable, "-c",
+         "import subprocess, sys, time\n"
+         f"subprocess.Popen([sys.executable, 'main.py', 'daemon', '--socket', {sock!r}, '--device', 'cpu',"
+         " '--exit-with-parent'])\n"
+         "time.sleep(60)\n"], cwd=str(ROOT))
+    try:
+        for _ in range(300):
+            if os.path.exists(sock):
+                break
+            __import__("time").sleep(0.1)
+        assert os.path.exists(sock)
+        with BridgeClient(sock) as c:
+            pid = c.call("ping")["pid"]
+    finally:
+        launcher.kill()
+        launcher.wait()
+    for _ in range(100):
+        if not os.path.exists(sock):
+            break
+        __import__("time").sleep(0.1)
+    assert not os.path.exists(sock)
+    gone = False
+    for _ in range(100):                                      # interpreter teardown takes a moment
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            gone = True
+            break
+        __import__("time").sleep(0.1)
+    assert gone

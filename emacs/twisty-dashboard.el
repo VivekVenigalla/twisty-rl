@@ -1,7 +1,7 @@
 ;;; twisty-dashboard.el --- TwistyRL 3D puzzle widget and interactive solver  -*- lexical-binding: t; -*-
 
 ;; Author: TwistyRL
-;; Version: 0.1.0
+;; Version: 0.2.0
 ;; Package-Requires: ((emacs "28.1"))
 ;; Keywords: games, tools
 
@@ -15,12 +15,17 @@
 ;;   (twisty-dashboard-mode 1)      ; rotating 3D puzzle in the corner of the startup buffer
 ;;   M-x twisty-dashboard           ; full interactive dashboard
 ;;
-;; `twisty-dashboard-mode' is a global minor mode: it starts the daemon when needed and paints a
-;; rotating Unicode half-block rendering of the puzzle into the top-right corner of the startup
-;; buffer (or any buffer, see `twisty-dashboard-attach').  `twisty-dashboard' opens a dedicated
-;; buffer in `twisty-mode' where the puzzle can be turned, scrambled, solved by the search engine
-;; (the solution is played back move by move), analysed with Schreier-Sims, mined for commutator
-;; macros and used to train the network while the Bellman loss is plotted live.
+;; Three layers, each usable on its own:
+;;
+;; * Connection: `twisty-connect' (blocking) and `twisty-connect-async' (never blocks, used by
+;;   timers and at startup) launch the daemon on demand; `twisty-request' /
+;;   `twisty-request-sync' issue calls.
+;; * Widget: `twisty-dashboard-attach' paints a live Unicode half-block rendering of the puzzle
+;;   onto any buffer with overlays, so the buffer text itself is never touched.  Position, size,
+;;   caption and the idle show (`twisty-show': spin, attract, daily) are options.
+;; * `twisty-dashboard' opens a dedicated buffer in `twisty-mode' where the puzzle can be turned,
+;;   scrambled, solved (the solution is animated), analysed with Schreier-Sims, mined for
+;;   commutator macros and used to train the network while the loss is plotted live.
 
 ;;; Code:
 
@@ -52,6 +57,13 @@ Defaults to the project's virtualenv when it exists."
   "Unix domain socket of the TwistyRL daemon."
   :type 'file)
 
+(defcustom twisty-daemon-device "cpu"
+  "Torch device of a daemon started from Emacs.
+One of \"cpu\", \"mps\", \"cuda\" or \"auto\".  The CPU is plenty for
+rendering and pattern-database search and keeps the GPU free; use
+\"auto\" when training from Emacs."
+  :type 'string)
+
 (defcustom twisty-default-puzzle "cube3"
   "Puzzle loaded when the daemon is started from Emacs."
   :type 'string)
@@ -61,8 +73,39 @@ Defaults to the project's virtualenv when it exists."
   :type 'number)
 
 (defcustom twisty-corner-size '(30 . 15)
-  "Size (COLUMNS . ROWS) of the corner widget."
+  "Size (COLUMNS . ROWS) of the widget of `twisty-dashboard-attach'."
   :type '(cons integer integer))
+
+(defcustom twisty-widget-position 'top-right
+  "Where `twisty-dashboard-attach' paints the widget inside the window."
+  :type '(choice (const top-right) (const top-left) (const top-center)))
+
+(defcustom twisty-widget-caption t
+  "Non-nil shows two caption lines (scramble, solution) under the widget."
+  :type 'boolean)
+
+(defcustom twisty-show 'spin
+  "What the puzzle does while the widget is idle.
+`spin' just rotates it, `attract' scrambles it and lets the search
+engine solve it in an endless loop, `daily' shows one fixed scramble
+per day."
+  :type '(choice (const spin) (const attract) (const daily)))
+
+(defcustom twisty-show-depth 9
+  "Number of scramble moves per round of the `attract' show."
+  :type 'integer)
+
+(defcustom twisty-show-pause 2.5
+  "Seconds the solved puzzle rests between rounds of the `attract' show."
+  :type 'number)
+
+(defcustom twisty-move-time 0.22
+  "Seconds one animated layer turn takes."
+  :type 'number)
+
+(defcustom twisty-spin-speed 0.6
+  "Rotation speed of the camera in radians per second."
+  :type 'number)
 
 (defcustom twisty-frame-size '(46 . 23)
   "Size (COLUMNS . ROWS) of the 3D view in the dashboard buffer."
@@ -70,10 +113,6 @@ Defaults to the project's virtualenv when it exists."
 
 (defcustom twisty-request-timeout 60
   "Seconds to wait for a synchronous daemon reply."
-  :type 'number)
-
-(defcustom twisty-playback-delay 0.18
-  "Seconds between moves when a solution is played back."
   :type 'number)
 
 (defface twisty-title '((t :inherit font-lock-keyword-face :weight bold :height 1.1))
@@ -90,10 +129,22 @@ Defaults to the project's virtualenv when it exists."
 (defvar twisty--next-id 0)
 (defvar twisty--callbacks (make-hash-table :test 'eql))
 (defvar twisty--partial "" "Unterminated tail of the daemon's output.")
+(defvar twisty--connecting nil "Non-nil while an asynchronous connection attempt runs.")
+(defvar twisty--connect-callbacks nil)
+(defvar twisty--connect-failures 0 "Consecutive failed asynchronous connection attempts.")
+(defvar twisty-connected-hook nil "Hook run each time a connection to the daemon opens.")
 
 (defun twisty--live-p ()
   "Return non-nil when the RPC connection is open."
   (and twisty--connection (process-live-p twisty--connection)))
+
+(defun twisty-available-p ()
+  "Return non-nil when a daemon can be reached or launched from here."
+  (or (twisty--live-p)
+      (file-exists-p twisty-socket-path)
+      (and (file-exists-p (expand-file-name "main.py" twisty-project-directory))
+           (executable-find twisty-python-command)
+           t)))
 
 (defun twisty--filter (_proc chunk)
   "Accumulate CHUNK and dispatch every complete JSON-RPC line."
@@ -120,48 +171,104 @@ Defaults to the project's virtualenv when it exists."
       (setq twisty--connection nil twisty--partial "")
       (clrhash twisty--callbacks))))
 
-(defun twisty-start-daemon ()
-  "Launch the TwistyRL daemon as a subprocess and wait for its socket."
-  (interactive)
+(defun twisty--open ()
+  "Open the socket; return the connection or nil when nobody listens."
+  (setq twisty--partial "")
+  (clrhash twisty--callbacks)
+  (setq twisty--connection
+        (condition-case nil
+            (make-network-process :name "twisty-rpc" :family 'local :service twisty-socket-path
+                                  :coding 'utf-8 :noquery t
+                                  :filter #'twisty--filter :sentinel #'twisty--sentinel)
+          (file-error nil)))
+  (when twisty--connection
+    (setq twisty--connect-failures 0)
+    (run-hooks 'twisty-connected-hook))
+  twisty--connection)
+
+(defun twisty--spawn-daemon ()
+  "Launch the daemon subprocess without waiting for it."
   (unless (and twisty--daemon-process (process-live-p twisty--daemon-process))
+    (unless (file-exists-p (expand-file-name "main.py" twisty-project-directory))
+      (error "No twisty-rl checkout at %s" twisty-project-directory))
     (let ((default-directory (file-name-as-directory twisty-project-directory))
           (process-connection-type nil))
       (setq twisty--daemon-process
             (start-process "twisty-daemon" (get-buffer-create " *twisty-daemon*")
                            twisty-python-command "main.py" "daemon"
-                           "--socket" twisty-socket-path "--puzzle" twisty-default-puzzle))
-      (set-process-query-on-exit-flag twisty--daemon-process nil)))
+                           "--socket" twisty-socket-path "--puzzle" twisty-default-puzzle
+                           "--device" twisty-daemon-device "--exit-with-parent"))
+      (set-process-query-on-exit-flag twisty--daemon-process nil))))
+
+(defun twisty-start-daemon ()
+  "Launch the TwistyRL daemon as a subprocess and wait for its socket."
+  (interactive)
+  (twisty--spawn-daemon)
   (let ((deadline (+ (float-time) 45)))
     (while (and (not (file-exists-p twisty-socket-path))
                 (process-live-p twisty--daemon-process)
                 (< (float-time) deadline))
       (accept-process-output twisty--daemon-process 0.1)))
   (unless (file-exists-p twisty-socket-path)
-    (error "twisty: daemon did not start (see buffer  *twisty-daemon*)")))
+    (error "The twisty daemon did not start (see buffer  *twisty-daemon*)")))
 
 (defun twisty-connect (&optional no-start)
-  "Connect to the daemon, starting it first unless NO-START is non-nil."
+  "Connect to the daemon, starting it first unless NO-START is non-nil.
+This blocks until the daemon answers; timers use `twisty-connect-async'."
   (interactive)
   (unless (twisty--live-p)
-    (unless (or (file-exists-p twisty-socket-path) no-start)
-      (twisty-start-daemon))
-    (setq twisty--partial "")
-    (clrhash twisty--callbacks)
-    (setq twisty--connection
-          (condition-case nil
-              (make-network-process :name "twisty-rpc" :family 'local :service twisty-socket-path
-                                    :coding 'utf-8 :noquery t
-                                    :filter #'twisty--filter :sentinel #'twisty--sentinel)
-            (file-error
-             ;; stale socket file left behind by a dead daemon
-             (if no-start
-                 (error "twisty: no daemon at %s" twisty-socket-path)
-               (ignore-errors (delete-file twisty-socket-path))
-               (twisty-start-daemon)
-               (make-network-process :name "twisty-rpc" :family 'local :service twisty-socket-path
-                                     :coding 'utf-8 :noquery t
-                                     :filter #'twisty--filter :sentinel #'twisty--sentinel))))))
+    (setq twisty--connect-failures 0)
+    (unless (and (file-exists-p twisty-socket-path) (twisty--open))
+      (when no-start
+        (error "No twisty daemon at %s" twisty-socket-path))
+      ;; no socket, or a stale one left behind by a dead daemon
+      (unless (and twisty--daemon-process (process-live-p twisty--daemon-process))
+        (ignore-errors (delete-file twisty-socket-path)))
+      (twisty-start-daemon)
+      (let ((deadline (+ (float-time) 10)))
+        (while (and (not (twisty--open)) (< (float-time) deadline))
+          (sleep-for 0.05)))
+      (unless (twisty--live-p)
+        (error "Could not connect to the twisty daemon"))))
   twisty--connection)
+
+(defun twisty--connect-finish (ok &optional reason)
+  "Finish an asynchronous attempt: OK non-nil on success, else REASON."
+  (setq twisty--connecting nil)
+  (let ((callbacks (nreverse twisty--connect-callbacks)))
+    (setq twisty--connect-callbacks nil)
+    (if ok
+        (mapc #'funcall callbacks)
+      (cl-incf twisty--connect-failures)
+      (message "twisty: %s%s" reason
+               (if (>= twisty--connect-failures 3) " (giving up; M-x twisty-connect retries)" "")))))
+
+(defun twisty--connect-poll (deadline)
+  "Poll for the daemon's socket until DEADLINE without blocking Emacs."
+  (cond ((twisty--live-p) (twisty--connect-finish t))
+        ((and (file-exists-p twisty-socket-path) (twisty--open)) (twisty--connect-finish t))
+        ((not (and twisty--daemon-process (process-live-p twisty--daemon-process)))
+         (twisty--connect-finish nil "daemon exited during startup (see buffer  *twisty-daemon*)"))
+        ((> (float-time) deadline) (twisty--connect-finish nil "daemon did not start in time"))
+        (t (run-with-timer 0.15 nil #'twisty--connect-poll deadline))))
+
+(defun twisty-connect-async (&optional callback)
+  "Connect to the daemon in the background, launching it when necessary.
+CALLBACK is called without arguments once the connection is open."
+  (cond ((twisty--live-p) (when callback (funcall callback)))
+        (twisty--connecting (when callback (push callback twisty--connect-callbacks)))
+        ((>= twisty--connect-failures 3) nil)
+        (t
+         (setq twisty--connecting t)
+         (when callback (push callback twisty--connect-callbacks))
+         (condition-case err
+             (if (and (file-exists-p twisty-socket-path) (twisty--open))
+                 (twisty--connect-finish t)
+               (unless (and twisty--daemon-process (process-live-p twisty--daemon-process))
+                 (ignore-errors (delete-file twisty-socket-path)))
+               (twisty--spawn-daemon)
+               (twisty--connect-poll (+ (float-time) 45)))
+           (error (twisty--connect-finish nil (error-message-string err)))))))
 
 (defun twisty-disconnect (&optional kill-daemon)
   "Close the RPC connection.
@@ -183,10 +290,8 @@ With KILL-DAEMON also shut down a daemon that this Emacs started."
       (setq twisty--daemon-process nil)
       (ignore-errors (delete-file twisty-socket-path)))))
 
-(defun twisty-request (method &optional params callback)
-  "Send METHOD with PARAMS (an alist) to the daemon.
-CALLBACK, if given, is called with (RESULT ERROR).  Return the request id."
-  (twisty-connect)
+(defun twisty--send (method params callback)
+  "Send METHOD with PARAMS over the open connection; register CALLBACK."
   (let ((id (cl-incf twisty--next-id)))
     (when callback
       (puthash id callback twisty--callbacks))
@@ -197,6 +302,12 @@ CALLBACK, if given, is called with (RESULT ERROR).  Return the request id."
              "\n"))
     id))
 
+(defun twisty-request (method &optional params callback)
+  "Send METHOD with PARAMS (an alist) to the daemon.
+CALLBACK, if given, is called with (RESULT ERROR).  Return the request id."
+  (twisty-connect)
+  (twisty--send method params callback))
+
 (defun twisty-request-sync (method &optional params timeout)
   "Call METHOD with PARAMS and wait for the result (up to TIMEOUT seconds)."
   (let* ((done nil) (result nil) (err nil)
@@ -205,8 +316,8 @@ CALLBACK, if given, is called with (RESULT ERROR).  Return the request id."
          (deadline (+ (float-time) (or timeout twisty-request-timeout))))
     (while (and (not done) (twisty--live-p) (< (float-time) deadline))
       (accept-process-output twisty--connection 0.05))
-    (cond (err (error "twisty: %s" (alist-get 'message err)))
-          ((not done) (remhash id twisty--callbacks) (error "twisty: `%s' timed out" method)))
+    (cond (err (error "Twisty: %s" (alist-get 'message err)))
+          ((not done) (remhash id twisty--callbacks) (error "Twisty: `%s' timed out" method)))
     result))
 
 ;;;; Rendering -----------------------------------------------------------------------------------
@@ -240,59 +351,124 @@ CALLBACK, if given, is called with (RESULT ERROR).  Return the request id."
   "Truncate or pad STRING to exactly WIDTH columns."
   (truncate-string-to-width string width nil ?\s))
 
-;;;; Corner widget -------------------------------------------------------------------------------
+(defun twisty--caption-lines (caption width)
+  "Wrap CAPTION into exactly two dimmed lines of WIDTH columns."
+  (let* ((words (split-string (or caption "") " " t))
+         (first "") (second ""))
+    (while (and words (<= (+ (length first) (length (car words)) (if (string-empty-p first) 0 1))
+                          width))
+      (setq first (concat first (if (string-empty-p first) "" " ") (pop words))))
+    (setq second (string-join words " "))
+    (when (> (length second) width)
+      (setq second (concat (substring second 0 (max 0 (1- width))) "…")))
+    (mapcar (lambda (line)
+              (let ((pad (max 0 (/ (- width (length line)) 2))))
+                (propertize (twisty--pad (concat (make-string pad ?\s) line) width)
+                            'face 'twisty-dim)))
+            (list first second))))
 
-(defvar twisty--corner-buffer nil "Buffer currently decorated with the corner widget.")
-(defvar twisty--corner-overlays nil)
+;;;; Widget --------------------------------------------------------------------------------------
+
+(defvar twisty--corner-buffer nil "Buffer currently decorated with the widget.")
+(defvar twisty--corner-overlays nil "Widget overlays, in painting order.")
+(defvar twisty--corner-key nil "Layout the current overlays were built for.")
+(defvar twisty--corner-layout nil "(INLINE-ROWS . EOB-AT-BOL) of the current overlays.")
 (defvar twisty--timer nil)
 (defvar twisty--pending nil "Non-nil while a dashboard request is in flight.")
 (defvar twisty--pending-since 0.0)
 
 (defun twisty--corner-clear ()
-  "Remove the corner widget overlays."
+  "Remove the widget overlays."
   (mapc #'delete-overlay twisty--corner-overlays)
-  (setq twisty--corner-overlays nil))
+  (setq twisty--corner-overlays nil twisty--corner-key nil twisty--corner-layout nil))
 
-(defun twisty--corner-paint (lines)
-  "Paint LINES into the top-right corner of `twisty--corner-buffer'."
+(defun twisty--widget-lead ()
+  "Display-property string that moves to the widget's left edge."
+  (let ((width (car twisty-corner-size)))
+    (pcase twisty-widget-position
+      ('top-center (propertize " " 'display `(space :align-to (- center ,(/ width 2)))))
+      ('top-left "")
+      (_ (propertize " " 'display `(space :align-to (- right ,(1+ width))))))))
+
+(defun twisty--widget-strings (lines)
+  "Overlay strings for LINES under the layout in `twisty--corner-layout'."
+  (let* ((lead (twisty--widget-lead))
+         (inline (car twisty--corner-layout))
+         (decorate (if (eq twisty-widget-position 'top-left)
+                       (lambda (row) (concat row "  "))
+                     (lambda (row) (concat lead row)))))
+    (if (eq twisty-widget-position 'top-center)
+        (list (concat (mapconcat decorate lines "\n") "\n"))
+      (let ((head (seq-take lines inline))
+            (rest (seq-drop lines inline)))
+        (append (mapcar decorate head)
+                (and rest
+                     (list (concat (if (cdr twisty--corner-layout) "" "\n")
+                                   (mapconcat decorate rest "\n")))))))))
+
+(defun twisty--corner-build (start count)
+  "Create overlays for COUNT rows beginning at buffer position START."
+  (twisty--corner-clear)
+  (let ((prop (if (eq twisty-widget-position 'top-right) 'after-string 'before-string))
+        (inline 0) overlays)
+    (cl-flet ((add (pos property)
+                (let ((ov (make-overlay pos pos)))
+                  (overlay-put ov 'twisty property)
+                  (push ov overlays))))
+      (save-excursion
+        (goto-char start)
+        (if (eq twisty-widget-position 'top-center)
+            (add (line-beginning-position) 'before-string)
+          (while (and (< inline count) (not (eobp)))
+            (add (if (eq prop 'after-string) (line-end-position) (line-beginning-position)) prop)
+            (cl-incf inline)
+            (forward-line 1))
+          (when (< inline count)
+            (goto-char (point-max))
+            (add (point-max) 'after-string)))
+        (setq twisty--corner-layout
+              (cons inline (progn (goto-char (point-max)) (bolp))))))
+    (setq twisty--corner-overlays (nreverse overlays))))
+
+(defun twisty--corner-paint (lines &optional caption)
+  "Paint LINES (and CAPTION) as the widget of `twisty--corner-buffer'."
   (when (buffer-live-p twisty--corner-buffer)
     (with-current-buffer twisty--corner-buffer
-      (twisty--corner-clear)
-      (let* ((width (car twisty-corner-size))
-             (lead (propertize " " 'display `(space :align-to (- right ,(1+ width)))))
-             (win (get-buffer-window twisty--corner-buffer t))
+      (let* ((lines (if twisty-widget-caption
+                        (append lines (twisty--caption-lines caption (car twisty-corner-size)))
+                      lines))
+             (win (get-buffer-window (current-buffer) t))
              (start (if win (window-start win) (point-min)))
-             (rest lines))
-        (save-excursion
-          (goto-char start)
-          (while (and rest (not (eobp)))
-            (let ((ov (make-overlay (line-end-position) (line-end-position))))
-              (overlay-put ov 'twisty t)
-              (overlay-put ov 'after-string (concat lead (car rest)))
-              (push ov twisty--corner-overlays))
-            (setq rest (cdr rest))
-            (forward-line 1))
-          (when rest
-            ;; the buffer has fewer lines than the widget: hang the remainder below its end
-            (goto-char (point-max))
-            (let ((ov (make-overlay (point-max) (point-max))))
-              (overlay-put ov 'twisty t)
-              (overlay-put ov 'after-string
-                           (concat (if (bolp) "" "\n")
-                                   (mapconcat (lambda (line) (concat lead line)) rest "\n")))
-              (push ov twisty--corner-overlays))))))))
+             (key (list start (buffer-chars-modified-tick) (length lines) twisty-widget-position)))
+        (unless (and twisty--corner-overlays (equal key twisty--corner-key))
+          (twisty--corner-build start (length lines))
+          (setq twisty--corner-key key))
+        (cl-mapc (lambda (ov string) (overlay-put ov (overlay-get ov 'twisty) string))
+                 twisty--corner-overlays (twisty--widget-strings lines))))))
+
+(defun twisty-sync-options ()
+  "Push the show and camera options to the daemon."
+  (interactive)
+  (when (twisty--live-p)
+    (twisty--send "show" `((mode . ,(symbol-name twisty-show)) (depth . ,twisty-show-depth)
+                           (pause . ,twisty-show-pause) (move_time . ,twisty-move-time))
+                  nil)
+    (twisty--send "spin" `((on . t) (speed . ,twisty-spin-speed)) nil)))
 
 ;;;###autoload
 (defun twisty-dashboard-attach (&optional buffer)
-  "Show the rotating puzzle in the top-right corner of BUFFER (default: current)."
+  "Show the live puzzle widget on BUFFER (default: the selected window's).
+The daemon is contacted in the background, so this never blocks."
   (interactive)
-  (twisty--corner-clear)
-  (setq twisty--corner-buffer (or buffer (window-buffer (selected-window))))
+  (when (buffer-live-p twisty--corner-buffer)
+    (with-current-buffer twisty--corner-buffer (twisty--corner-clear)))
+  (setq twisty--corner-buffer (or buffer (window-buffer (selected-window)))
+        twisty--connect-failures 0)
   (twisty--ensure-timer)
-  (twisty--tick))
+  (twisty-connect-async #'twisty-sync-options))
 
 (defun twisty-dashboard-detach ()
-  "Remove the corner widget."
+  "Remove the widget."
   (interactive)
   (when (buffer-live-p twisty--corner-buffer)
     (with-current-buffer twisty--corner-buffer (twisty--corner-clear)))
@@ -304,8 +480,6 @@ CALLBACK, if given, is called with (RESULT ERROR).  Return the request id."
 (defvar twisty--status nil "Last status alist received from the daemon.")
 (defvar twisty--message "" "Transient message shown in the dashboard.")
 (defvar twisty--show-net t)
-(defvar twisty--playback nil "Moves still to be played back.")
-(defvar twisty--playback-timer nil)
 (defvar twisty--group-info nil)
 (defvar twisty--macros nil)
 
@@ -320,6 +494,7 @@ CALLBACK, if given, is called with (RESULT ERROR).  Return the request id."
          (loss (alist-get 'loss series))
          (events (alist-get 'events telemetry))
          (solution (alist-get 'last_solution status))
+         (show (alist-get 'show status))
          (lines
           (list
            (propertize (format "TwistyRL · %s" (alist-get 'puzzle status)) 'face 'twisty-title)
@@ -332,6 +507,8 @@ CALLBACK, if given, is called with (RESULT ERROR).  Return the request id."
                                        (string-join (last (alist-get 'history status) 12) " ")))
            (twisty--kv "|G| (BSGS)" (or (alist-get 'group_order status) "…"))
            (twisty--kv "device" (alist-get 'device status))
+           (twisty--kv "show" (format "%s%s" (alist-get 'mode show)
+                                      (if (alist-get 'paused show) " (paused, . resumes)" "")))
            (twisty--kv "training"
                        (format "%s  step %s"
                                (if (alist-get 'training status) (alist-get 'training_mode status) "idle")
@@ -369,7 +546,7 @@ CALLBACK, if given, is called with (RESULT ERROR).  Return the request id."
                               'face 'twisty-dim)
                   (propertize "z undo · 0 reset · p puzzle · g BSGS · c macros · t train · a PAIRED"
                               'face 'twisty-dim)
-                  (propertize "arrows rotate · . spin · + - zoom · n net · q quit"
+                  (propertize "arrows rotate · , spin · . show on/off · + - zoom · n net · q quit"
                               'face 'twisty-dim)))))
 
 (defun twisty--paint-dashboard (data)
@@ -407,39 +584,53 @@ CALLBACK, if given, is called with (RESULT ERROR).  Return the request id."
           (net_height . ,(if twisty--show-net 14 0)))
       `((width . ,(car twisty-corner-size)) (height . ,(cdr twisty-corner-size))))))
 
+(defun twisty--caption-of (status)
+  "Caption text carried by STATUS."
+  (alist-get 'caption (alist-get 'show status)))
+
 (defun twisty--tick ()
-  "Request one refresh of every visible TwistyRL view."
+  "Request one refresh of every visible TwistyRL view.
+Runs from a timer, so it never blocks: without a connection it only
+kicks off `twisty-connect-async'."
   (when (and twisty--pending (> (- (float-time) twisty--pending-since) 5.0))
     (setq twisty--pending nil))
   (let* ((buf (get-buffer twisty-buffer-name))
          (dash (and buf (get-buffer-window buf t)))
          (corner (and (buffer-live-p twisty--corner-buffer)
                       (get-buffer-window twisty--corner-buffer t))))
-    (when (and (or dash corner) (not twisty--pending))
+    (cond
+     ((not (or dash corner)) nil)
+     ((not (twisty--live-p)) (twisty-connect-async (and corner #'twisty-sync-options)))
+     (twisty--pending nil)
+     (t
       (condition-case err
           (progn
             (setq twisty--pending t twisty--pending-since (float-time))
-            (twisty-request
+            (twisty--send
              "dashboard" (twisty--dashboard-params)
              (lambda (result error)
                (setq twisty--pending nil)
                (when (and result (not error))
-                 (setq twisty--status (alist-get 'status result))
-                 (when (get-buffer-window twisty-buffer-name t)
-                   (twisty--paint-dashboard result))
-                 (when (and (buffer-live-p twisty--corner-buffer)
-                            (not (eq twisty--corner-buffer (get-buffer twisty-buffer-name))))
-                   (if (get-buffer-window twisty-buffer-name t)
-                       ;; the corner widget needs its own, smaller frame
-                       (twisty-request
-                        "render" `((width . ,(car twisty-corner-size)) (height . ,(cdr twisty-corner-size)))
-                        (lambda (frame err2)
-                          (when (and frame (not err2))
-                            (twisty--corner-paint (twisty--frame-lines frame)))))
-                     (twisty--corner-paint (twisty--frame-lines (alist-get 'frame result)))))))))
+                 (let ((status (alist-get 'status result)))
+                   (setq twisty--status status)
+                   (when (get-buffer-window twisty-buffer-name t)
+                     (twisty--paint-dashboard result))
+                   (when (and (buffer-live-p twisty--corner-buffer)
+                              (not (eq twisty--corner-buffer (get-buffer twisty-buffer-name))))
+                     (if (get-buffer-window twisty-buffer-name t)
+                         ;; the widget needs its own, differently sized frame
+                         (twisty--send
+                          "render" `((width . ,(car twisty-corner-size))
+                                     (height . ,(cdr twisty-corner-size)))
+                          (lambda (frame err2)
+                            (when (and frame (not err2))
+                              (twisty--corner-paint (twisty--frame-lines frame)
+                                                    (twisty--caption-of status)))))
+                       (twisty--corner-paint (twisty--frame-lines (alist-get 'frame result))
+                                             (twisty--caption-of status)))))))))
         (error
          (setq twisty--pending nil)
-         (message "twisty: %s" (error-message-string err)))))))
+         (message "twisty: %s" (error-message-string err))))))))
 
 (defun twisty--ensure-timer ()
   "Start the refresh timer if it is not running."
@@ -451,6 +642,11 @@ CALLBACK, if given, is called with (RESULT ERROR).  Return the request id."
   (when twisty--timer
     (cancel-timer twisty--timer)
     (setq twisty--timer nil)))
+
+(defun twisty-restart-timer ()
+  "Restart the refresh timer (after changing `twisty-fps')."
+  (twisty--stop-timer)
+  (twisty--ensure-timer))
 
 ;;;; Interactive commands ------------------------------------------------------------------------
 
@@ -473,7 +669,7 @@ CALLBACK, if given, is called with (RESULT ERROR).  Return the request id."
    (list (completing-read-multiple "Moves (comma or space separated): " (twisty--actions))))
   (let ((text (if (listp moves) (string-join moves " ") moves)))
     (setq twisty--message "")
-    (twisty--call "apply" `((moves . ,text)))))
+    (twisty--call "play" `((moves . ,text)))))
 
 (defun twisty-key-move ()
   "Turn the face named by the key that invoked this command.
@@ -494,7 +690,6 @@ name (Pyraminx tips)."
 (defun twisty-scramble (&optional depth)
   "Scramble the puzzle with DEPTH random moves (prefix argument, default 20)."
   (interactive "P")
-  (twisty--stop-playback)
   (let ((res (twisty--call "scramble" `((depth . ,(if depth (prefix-numeric-value depth) 20))))))
     (when res
       (setq twisty--message (format "scramble: %s" (string-join (alist-get 'scramble res) " "))))))
@@ -502,7 +697,6 @@ name (Pyraminx tips)."
 (defun twisty-reset ()
   "Return the puzzle to its solved state."
   (interactive)
-  (twisty--stop-playback)
   (twisty--call "reset"))
 
 (defun twisty-undo ()
@@ -510,25 +704,11 @@ name (Pyraminx tips)."
   (interactive)
   (twisty--call "undo"))
 
-(defun twisty--stop-playback ()
-  "Abort a running solution playback."
-  (when twisty--playback-timer
-    (cancel-timer twisty--playback-timer))
-  (setq twisty--playback nil twisty--playback-timer nil))
-
-(defun twisty--playback-step ()
-  "Apply the next move of the solution being played back."
-  (if (null twisty--playback)
-      (twisty--stop-playback)
-    (let ((move (pop twisty--playback)))
-      (twisty-request "apply" `((moves . ,move)) (lambda (_r _e) (twisty--tick))))))
-
 (defun twisty-solve (&optional method)
   "Ask the search engine for a solution and play it back.
 With a prefix argument prompt for the search METHOD."
   (interactive
    (list (if current-prefix-arg (completing-read "Method: " '("auto" "astar" "beam") nil t) "auto")))
-  (twisty--stop-playback)
   (setq twisty--message "searching…")
   (twisty-request
    "solve" `((method . ,(or method "auto")))
@@ -541,9 +721,8 @@ With a prefix argument prompt for the search METHOD."
                             (length moves)
                             (if (alist-get 'optimal_proven result) " (optimal)" "")
                             (alist-get 'nodes_generated result) (alist-get 'elapsed result)))
-              (setq twisty--playback (copy-sequence moves))
-              (setq twisty--playback-timer
-                    (run-with-timer 0.05 twisty-playback-delay #'twisty--playback-step))))
+              (when moves
+                (twisty-request "play" `((moves . ,(string-join moves " ")))))))
            (t (setq twisty--message (format "no solution: %s" (alist-get 'reason result)))))
      (message "%s" twisty--message))))
 
@@ -551,7 +730,6 @@ With a prefix argument prompt for the search METHOD."
   "Switch the daemon to puzzle NAME."
   (interactive
    (list (completing-read "Puzzle: " (twisty-request-sync "list_puzzles") nil t)))
-  (twisty--stop-playback)
   (setq twisty--group-info nil twisty--macros nil twisty--message "")
   (twisty--call "set_puzzle" `((name . ,name))))
 
@@ -599,6 +777,26 @@ With prefix PROMOTE add that many of the best to the action space."
   (interactive)
   (twisty-train t))
 
+(defun twisty-show-toggle ()
+  "Pause or resume the idle show (see `twisty-show')."
+  (interactive)
+  (let* ((paused (alist-get 'paused (alist-get 'show twisty--status)))
+         (res (twisty--call "show" `((mode . ,(symbol-name twisty-show))
+                                     (paused . ,(if paused :false t))))))
+    (when res
+      (message "twisty show: %s%s" (alist-get 'mode res)
+               (if (alist-get 'paused res) " (paused)" "")))))
+
+(defun twisty-show-cycle ()
+  "Switch to the next idle show: spin, attract, daily."
+  (interactive)
+  (setq twisty-show (pcase twisty-show ('spin 'attract) ('attract 'daily) (_ 'spin)))
+  (when (eq twisty-show 'spin)
+    (twisty--call "reset"))
+  (twisty--call "show" `((mode . ,(symbol-name twisty-show)) (depth . ,twisty-show-depth)
+                         (pause . ,twisty-show-pause) (move_time . ,twisty-move-time)))
+  (message "twisty show: %s" twisty-show))
+
 (defun twisty-rotate-left () "Rotate the camera left." (interactive)
        (twisty--call "rotate" '((dyaw . -0.3))))
 (defun twisty-rotate-right () "Rotate the camera right." (interactive)
@@ -620,7 +818,6 @@ With prefix PROMOTE add that many of the best to the action space."
 (defun twisty-quit ()
   "Bury the dashboard buffer."
   (interactive)
-  (twisty--stop-playback)
   (quit-window))
 
 (defvar twisty-mode-map
@@ -640,7 +837,8 @@ With prefix PROMOTE add that many of the best to the action space."
     (define-key map (kbd "t") #'twisty-train)
     (define-key map (kbd "a") #'twisty-train-adversarial)
     (define-key map (kbd "n") #'twisty-toggle-net)
-    (define-key map (kbd ".") #'twisty-toggle-spin)
+    (define-key map (kbd ",") #'twisty-toggle-spin)
+    (define-key map (kbd ".") #'twisty-show-toggle)
     (define-key map (kbd "<left>") #'twisty-rotate-left)
     (define-key map (kbd "<right>") #'twisty-rotate-right)
     (define-key map (kbd "<up>") #'twisty-rotate-up)
@@ -679,17 +877,14 @@ With prefix PROMOTE add that many of the best to the action space."
 ;;;; Global minor mode ---------------------------------------------------------------------------
 
 (defun twisty--attach-startup ()
-  "Attach the corner widget to the buffer shown at startup."
+  "Attach the widget to the buffer shown at startup."
   (condition-case err
-      (progn
-        (twisty-connect)
-        (twisty-dashboard-attach (window-buffer (selected-window))))
+      (twisty-dashboard-attach (window-buffer (selected-window)))
     (error (message "twisty-dashboard: %s" (error-message-string err)))))
 
-(defun twisty--shutdown ()
+(defun twisty-shutdown ()
   "Stop timers and a daemon owned by this Emacs."
   (twisty--stop-timer)
-  (twisty--stop-playback)
   (ignore-errors (twisty-disconnect t)))
 
 ;;;###autoload
@@ -701,7 +896,7 @@ The daemon is started on demand.
   :lighter " Twisty"
   (if twisty-dashboard-mode
       (progn
-        (add-hook 'kill-emacs-hook #'twisty--shutdown)
+        (add-hook 'kill-emacs-hook #'twisty-shutdown)
         (if after-init-time
             (run-with-idle-timer 0.2 nil #'twisty--attach-startup)
           (add-hook 'emacs-startup-hook
@@ -729,15 +924,30 @@ The socket is taken from the environment variable TWISTY_SOCKET."
       (cl-assert (= (length lines) 15))
       (cl-assert (cl-some (lambda (l) (string-match-p "[▀▄]" l)) lines))
       (cl-assert (cl-some (lambda (l) (text-property-not-all 0 (length l) 'face nil l)) lines))
-      ;; corner widget on a short buffer
-      (with-temp-buffer
-        (insert "hello\nworld\n")
-        (setq twisty--corner-buffer (current-buffer))
-        (twisty--corner-paint lines)
-        (cl-assert (>= (length twisty--corner-overlays) 3))
-        (cl-assert (cl-every (lambda (ov) (overlay-get ov 'after-string)) twisty--corner-overlays))
-        (twisty--corner-clear)
-        (setq twisty--corner-buffer nil)))
+      ;; the widget on a short buffer, in every position, with and without caption
+      (dolist (position '(top-right top-left top-center))
+        (dolist (caption '(t nil))
+          (let ((twisty-widget-position position)
+                (twisty-widget-caption caption))
+            (with-temp-buffer
+              (insert "hello\nworld\n")
+              (setq twisty--corner-buffer (current-buffer))
+              (twisty--corner-paint lines "scramble: R U F")
+              (cl-assert (= (length twisty--corner-overlays) (if (eq position 'top-center) 1 3)))
+              (let ((strings (mapcar (lambda (ov) (overlay-get ov (overlay-get ov 'twisty)))
+                                     twisty--corner-overlays)))
+                (cl-assert (cl-every #'stringp strings))
+                (cl-assert (eq (and (string-match-p "scramble: R U F" (string-join strings "\n")) t)
+                               caption))
+                (cl-assert (= (cl-count ?\n (string-join strings "\n"))
+                              (+ (if caption 17 15) (if (eq position 'top-center) 0 -1)))))
+              ;; repainting reuses the overlays
+              (let ((before (copy-sequence twisty--corner-overlays)))
+                (twisty--corner-paint lines "solved")
+                (cl-assert (equal before twisty--corner-overlays)))
+              (twisty--corner-clear)
+              (setq twisty--corner-buffer nil))))))
+    (cl-assert (equal (mapcar #'string-trim (twisty--caption-lines "a b c d" 4)) '("a b" "c d")))
     ;; full dashboard buffer
     (let ((buf (get-buffer-create twisty-buffer-name)))
       (with-current-buffer buf (twisty-mode))
@@ -747,11 +957,22 @@ The socket is taken from the environment variable TWISTY_SOCKET."
         (cl-assert (string-match-p "TwistyRL · cube3" (buffer-string)))
         (cl-assert (string-match-p "scrambled" (buffer-string)))
         (cl-assert (> (count-lines (point-min) (point-max)) 30))))
-    ;; solve the four-move scramble and replay the solution
+    ;; solve the four-move scramble and replay the solution with animated playback
     (let ((res (twisty-request-sync "solve" '((time_limit . 30)))))
       (cl-assert (alist-get 'solved res))
-      (twisty-request-sync "apply" `((moves . ,(string-join (alist-get 'moves res) " "))))
+      (twisty-request-sync "play" `((moves . ,(string-join (alist-get 'moves res) " "))
+                                    (move_time . 0.02)))
+      (let ((deadline (+ (float-time) 10)))
+        (while (and (not (alist-get 'solved (alist-get 'status (twisty-request-sync "dashboard"))))
+                    (< (float-time) deadline))
+          (sleep-for 0.02)))
       (cl-assert (alist-get 'solved (twisty-request-sync "status"))))
+    ;; idle shows
+    (cl-assert (equal (alist-get 'mode (twisty-request-sync "show" '((mode . "daily")))) "daily"))
+    (cl-assert (string-match-p "scramble of the day"
+                               (twisty--caption-of (twisty-request-sync "status"))))
+    (cl-assert (equal (alist-get 'mode (twisty-request-sync "show" '((mode . "spin")))) "spin"))
+    (twisty-request-sync "reset")
     (cl-assert (equal (twisty--sparkline '(0.0 1.0) 2) "▁█"))
     (cl-assert (eq (lookup-key twisty-mode-map (kbd "SPC")) #'twisty-solve))
     (twisty-disconnect)
