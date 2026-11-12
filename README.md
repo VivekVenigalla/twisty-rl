@@ -73,6 +73,11 @@ database goals, solvability).
 (twisty-dashboard-mode 1)   ; rotating puzzle in the corner of the startup buffer
 ```
 
+`twisty-dashboard-attach` paints the live widget onto any buffer with overlays. Its position
+(`twisty-widget-position`), size (`twisty-corner-size`), caption and idle show (`twisty-show`:
+`spin`, `attract` = scramble and solve forever, `daily` = scramble of the day) are options, and
+the daemon is contacted asynchronously so startup never blocks.
+
 `M-x twisty-dashboard` opens the interactive buffer: `U D L R F B` turn faces (lowercase for the
 inverse), `m` enters any move string, `s` scrambles, `SPC` solves and plays the solution back,
 `g` runs Schreier-Sims, `c` mines commutators, `t` / `a` start ADI / PAIRED training, arrows rotate.
