@@ -367,7 +367,8 @@ def list_puzzles() -> list[str]:
 def get_spec(name: str) -> PuzzleSpec:
     key = ALIASES.get(name, name)
     if key in REGISTRY:
-        return REGISTRY[key]()
+        spec = REGISTRY[key]()
+        return spec if spec.name == key else spec.model_copy(update={"name": key})
     for prefix, factory in (("cube", cube), ("pancake", pancake), ("star", star), ("lights_out", lights_out)):
         if key.startswith(prefix) and key[len(prefix):].isdigit():
             return factory(int(key[len(prefix):]))

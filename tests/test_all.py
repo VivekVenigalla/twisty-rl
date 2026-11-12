@@ -1012,3 +1012,17 @@ def test_cli_entry_points(capsys):
     assert cli.main(["render", "pyraminx", "--scramble", "3", "--width", "30", "--height", "12"]) == 0
     assert "▀" in capsys.readouterr().out
     assert cli.main(["render", "--solid", "dodecahedron", "--width", "20", "--height", "10"]) == 0
+
+
+def test_registry_names_are_stable_and_session_cycles_all_puzzles():
+    assert all(get_puzzle(n).name == n for n in ALL)
+    s = Session("cube2", device="cpu")
+    for name in ALL:
+        s.set_puzzle(name)
+        assert s.puzzle.name == name and s.is_solved()
+        s.scramble(6)
+        assert s.is_solvable() and len(s.legal_moves()) >= 1
+        assert s.render(24, 12).coverage() > 0 and s.render(40, 12, view="net").coverage() > 0
+        if s.history or s.scramble_moves:
+            s.reset()
+            assert s.is_solved()
