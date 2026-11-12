@@ -113,8 +113,8 @@ Terminal.app with a 12 pt font is about 2.15; a wrong value makes the
 puzzle look squashed or stretched."
   :type 'number)
 
-(defcustom twisty-render-quality 3
-  "Anti-aliasing level of the 3D view (1 = none, 3 = smooth, up to 6)."
+(defcustom twisty-render-quality 4
+  "Anti-aliasing level of the 3D view (1 = none, 4 = smooth, up to 6)."
   :type 'integer)
 
 (defcustom twisty-camera-pitch 0.55

@@ -19,13 +19,14 @@ import numpy as np
 from rich.style import Style
 from rich.text import Text
 
-from .geometry import euler_matrix, halfspace_faces, normalize, polygon_centroid, rotation_matrix
+from .geometry import euler_matrix, halfspace_faces, normalize, polygon_centroid, rotation_matrix, split_polygon
 from .schema import Puzzle
 
 UPPER, LOWER = "▀", "▄"
 BODY_COLOR = np.array([14, 14, 17], dtype=np.float64)
 LIGHT_DIR = normalize((0.30, 0.78, 0.55))
-AMBIENT = 0.64                      # stickers stay recognisably their own colour on every face
+_TO_LINEAR = (np.arange(256, dtype=np.float64) / 255.0) ** 2.2
+AMBIENT = 0.70                      # stickers stay recognisably their own colour on every face
 
 
 # ----------------------------------------------------------------------------------
@@ -44,6 +45,7 @@ class Frame:
     color: np.ndarray
     mask: np.ndarray
     overlay: dict[tuple[int, int], tuple[str, tuple[int, int, int], tuple[int, int, int]]] = field(default_factory=dict)
+    background: Optional[tuple[int, int, int]] = None      # colour the frame was composited over, if any
 
     @property
     def rows(self) -> int:
@@ -67,7 +69,10 @@ class Frame:
                     cell = ov
                 elif mt[c] and mb[c]:
                     t, b = tuple(int(v) for v in top[c]), tuple(int(v) for v in bot[c])
-                    cell = (" ", None, t) if t == b else (UPPER, t, b)
+                    if t != b:
+                        cell = (UPPER, t, b)
+                    else:                        # untouched background stays unstyled: no visible box
+                        cell = (" ", None, None if t == self.background else t)
                 elif mt[c]:
                     cell = (UPPER, tuple(int(v) for v in top[c]), None)
                 elif mb[c]:
@@ -183,17 +188,23 @@ class Rasterizer:
         s = self.ss
         if s == 1 and bg is None:
             return Frame(self.color.copy(), covered)
-        acc = (self.color.astype(np.float64) * covered[..., None]).reshape(self.h2, s, self.width, s, 3).sum((1, 3))
+        # average in linear light: blending sRGB values directly turns every edge muddy and dark
+        lin = _TO_LINEAR[self.color] * covered[..., None]
+        acc = lin.reshape(self.h2, s, self.width, s, 3).sum((1, 3))
         cnt = covered.reshape(self.h2, s, self.width, s).sum((1, 3)).astype(np.float64)
         if bg is not None:
-            out = (acc + (s * s - cnt)[..., None] * np.asarray(bg, dtype=np.float64)) / (s * s)
+            out = (acc + (s * s - cnt)[..., None] * _TO_LINEAR[np.asarray(bg, dtype=np.uint8)]) / (s * s)
             mask = np.ones((self.h2, self.width), dtype=bool)
         else:
             out = acc / np.maximum(cnt, 1.0)[..., None]
             mask = cnt >= (s * s) / 2.0
+        out = 255.0 * np.clip(out, 0.0, 1.0) ** (1.0 / 2.2)
         # a small colour lattice keeps runs long and the number of distinct terminal faces bounded
-        out = np.clip(np.round(out / 6.0) * 6.0, 0, 255).astype(np.uint8)
-        return Frame(out, mask)
+        out = np.clip(np.round(out / 5.0) * 5.0, 0, 255).astype(np.uint8)
+        if bg is None:
+            return Frame(out, mask)
+        out[cnt == 0] = np.asarray(bg, dtype=np.uint8)          # empty pixels are *exactly* the background
+        return Frame(out, mask, background=tuple(int(v) for v in bg))
 
 
 # ----------------------------------------------------------------------------------
@@ -227,16 +238,18 @@ SOLID_PALETTES = {
 
 
 def _project(pts: np.ndarray, width: int, h2: int, zoom: float, distance: float,
-             cell_aspect: float = 2.0) -> tuple[np.ndarray, np.ndarray]:
+             cell_aspect: float = 2.0, scale: Optional[float] = None) -> tuple[np.ndarray, np.ndarray]:
     """Perspective projection onto a ``width x h2`` sample grid.
 
     ``cell_aspect`` is the height / width of a terminal cell; a half-block pixel is therefore
     ``cell_aspect / 2`` times taller than wide and the vertical scale compensates for it.
+    ``scale`` (samples per unit, horizontally) overrides the default ``zoom``-based scale.
     """
     depth = distance - pts[:, 2]
     f = distance * 0.92
     tall = max(cell_aspect, 0.5) / 2.0
-    scale = 0.5 * min(width, h2 * tall) * zoom
+    if scale is None:
+        scale = 0.5 * min(width, h2 * tall) * zoom
     sx = width / 2 + pts[:, 0] * f / depth * scale
     sy = h2 / 2 - pts[:, 1] * f / depth * scale / tall
     return np.stack([sx, sy], axis=1), depth
@@ -269,7 +282,7 @@ def render_solid(kind: str, width: int = 40, height: int = 20, yaw: float = 0.6,
 class PuzzleRenderer:
     """Cached mesh of one puzzle; renders arbitrary states in 3D and as a 2D net."""
 
-    def __init__(self, puzzle: Puzzle, inset: float = 0.88):
+    def __init__(self, puzzle: Puzzle, inset: float = 0.84):
         self.puzzle = puzzle
         geom = puzzle.spec.geometry
         if geom is None:
@@ -301,21 +314,90 @@ class PuzzleRenderer:
         self.base_zoom = 0.82 / max(radius, 1e-9)
         self.labels = puzzle.spec.labels
         self.animations = geom.animations
+        self._extent_cache: dict[tuple[float, float, float], tuple[float, float]] = {}
+        self._parts_cache: dict[str, Optional[tuple[list, list]]] = {}
+        self._centroids = np.array([polygon_centroid(p) for p in self.polys])
 
     # -- 3D ---------------------------------------------------------------------------------
+    def _body_parts(self, name: str) -> Optional[tuple[list, list]]:
+        """Split the solid body along the cut of move ``name`` -> ``(static faces, turning faces)``.
+
+        The cutting plane lies between the stickers that turn and those that stay, so it is
+        recovered from the animation's facet list.  Both halves are closed with a cap polygon, which
+        is what makes a layer look like a solid slab while it turns.
+        """
+        if name in self._parts_cache:
+            return self._parts_cache[name]
+        parts = None
+        anim = self.animations.get(name)
+        if anim is not None and self.body and not self.double_sided and 0 < len(anim.facets) < len(self.polys):
+            axis = normalize(anim.axis)
+            along = self._centroids @ axis
+            moving = np.zeros(len(self.polys), dtype=bool)
+            moving[anim.facets] = True
+            lo, hi = float(along[~moving].max()), float(along[moving].min())
+            if hi > lo:
+                depth = 0.5 * (lo + hi)
+                static, turning, rim = [], [], []
+                for face in self.body:
+                    front, back = split_polygon(face, axis, depth)
+                    if front is not None:
+                        turning.append(front)
+                        rim.extend(v for v in front if abs(float(v @ axis) - depth) < 1e-6)
+                    if back is not None:
+                        static.append(back)
+                if len(rim) >= 3:
+                    pts = np.array(rim)
+                    centre = pts.mean(axis=0)
+                    u = normalize(np.cross(axis, (1.0, 0.0, 0.0) if abs(axis[0]) < 0.9 else (0.0, 1.0, 0.0)))
+                    v = np.cross(axis, u)
+                    order = np.argsort(np.arctan2((pts - centre) @ v, (pts - centre) @ u))
+                    ring = [pts[order[0]]]
+                    for i in order[1:]:
+                        if np.linalg.norm(pts[i] - ring[-1]) > 1e-6:
+                            ring.append(pts[i])
+                    cap = np.array(ring)                       # counter-clockwise seen from +axis
+                    static.append(cap)                         # outward normal +axis
+                    turning.append(cap[::-1])                  # outward normal -axis
+                    parts = (static, turning)
+        self._parts_cache[name] = parts
+        return parts
+
+    def _extent(self, pitch: float, roll: float, distance: float) -> tuple[float, float]:
+        """Largest projected half-width / half-height of the puzzle over a full turn of the camera."""
+        key = (round(pitch, 3), round(roll, 3), round(distance, 3))
+        hit = self._extent_cache.get(key)
+        if hit is None:
+            verts = np.concatenate(self.polys + self.body)
+            ex = ey = 1e-9
+            for yaw in np.linspace(0.0, 2.0 * math.pi, 48, endpoint=False):
+                p = verts @ euler_matrix(float(yaw), pitch, roll).T
+                k = distance * 0.92 / (distance - p[:, 2])
+                ex = max(ex, float(np.abs(p[:, 0] * k).max()))
+                ey = max(ey, float(np.abs(p[:, 1] * k).max()))
+            hit = self._extent_cache[key] = (ex, ey)
+        return hit
+
     def render_3d(self, P: np.ndarray, width: int = 48, height: int = 24, yaw: float = 0.6, pitch: float = 0.45,
                   roll: float = 0.0, zoom: float = 1.0, distance: float = 4.2,
                   anim: Optional[tuple[str, float]] = None, supersample: int = 1,
-                  bg: Optional[tuple[int, int, int]] = None, cell_aspect: float = 2.0) -> Frame:
+                  bg: Optional[tuple[int, int, int]] = None, cell_aspect: float = 2.0,
+                  fit: bool = False) -> Frame:
         """Render permutation state ``P``.  ``anim=(move_name, t)`` shows that move ``t`` of the way through.
 
         ``supersample`` anti-aliases, ``bg`` composites over a known background colour and
         ``cell_aspect`` corrects for terminal cells that are not exactly twice as tall as wide.
+        ``fit`` scales the puzzle so that it fills the frame at every rotation angle.
         """
         colors = self.palette[self.puzzle.solved_colors[np.asarray(P)]]
         R = euler_matrix(yaw, pitch, roll)
         ras = Rasterizer(width, height, supersample)
         cam = np.array([0.0, 0.0, distance])
+        scale = None
+        if fit:
+            ex, ey = self._extent(pitch, roll, distance)
+            tall = max(cell_aspect, 0.5) / 2.0
+            scale = 0.93 * zoom * min(ras.pw / (2.0 * ex), ras.ph * tall / (2.0 * ey))
         zoom = zoom * self.base_zoom
         moving: set[int] = set()
         Rm = None
@@ -323,20 +405,23 @@ class PuzzleRenderer:
             a = self.animations[anim[0]]
             moving = set(a.facets)
             Rm = R @ rotation_matrix(a.axis, a.angle * float(np.clip(anim[1], 0.0, 1.0)))
-        for body in self.body:
-            pts = body * 0.985 @ R.T
-            n = normalize(np.cross(pts[1] - pts[0], pts[2] - pts[0]))
-            if not self.double_sided and n @ (cam - pts[0]) <= 0:
-                continue
-            scr, depth = _project(pts, ras.pw, ras.ph, zoom, distance, cell_aspect)
-            ras.polygon(scr, depth + (0.06 if self.double_sided else 0.0), _shade(BODY_COLOR, n, self.double_sided))
+        parts = self._body_parts(anim[0]) if Rm is not None else None
+        solids = [(self.body, R)] if parts is None else [(parts[0], R), (parts[1], Rm)]
+        for faces, M in solids:
+            for body in faces:
+                pts = body * 0.985 @ M.T
+                n = normalize(np.cross(pts[1] - pts[0], pts[2] - pts[0]))
+                if not self.double_sided and n @ (cam - pts[0]) <= 0:
+                    continue
+                scr, depth = _project(pts, ras.pw, ras.ph, zoom, distance, cell_aspect, scale)
+                ras.polygon(scr, depth + (0.06 if self.double_sided else 0.0), _shade(BODY_COLOR, n, self.double_sided))
         for i, poly in enumerate(self.polys):
             M = Rm if i in moving else R
             pts = poly @ M.T
             n = M @ self.normals[i]
             if not self.double_sided and n @ (cam - pts[0]) <= 0:
                 continue
-            scr, depth = _project(pts, ras.pw, ras.ph, zoom, distance, cell_aspect)
+            scr, depth = _project(pts, ras.pw, ras.ph, zoom, distance, cell_aspect, scale)
             ras.polygon(scr, depth, _shade(colors[i], n, self.double_sided))
         return ras.frame(bg)
 

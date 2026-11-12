@@ -1129,3 +1129,48 @@ def test_daemon_show_play_and_parent_watchdog(daemon, tmp_path):
             break
         __import__("time").sleep(0.1)
     assert gone
+
+
+def test_clean_terminal_look():
+    """Anti-aliasing over a known background, fit-to-frame, aspect correction and solid turning layers."""
+    pz = get_puzzle("cube3")
+    r = get_renderer(pz)
+    bg = (40, 44, 52)
+    plain = r.render_3d(pz.identity, 40, 20, yaw=0.6, pitch=0.55)
+    fitted = r.render_3d(pz.identity, 40, 20, yaw=0.6, pitch=0.55, fit=True, distance=7.0)
+    assert fitted.coverage() > 1.3 * plain.coverage()                    # the cube fills its frame
+    for yaw in np.linspace(0, 6.28, 9):                                  # ... without touching the border
+        f = r.render_3d(pz.identity, 40, 20, yaw=float(yaw), pitch=0.55, fit=True, distance=7.0)
+        assert not f.mask[0].any() and not f.mask[-1].any() and not f.mask[:, 0].any() and not f.mask[:, -1].any()
+    smooth = r.render_3d(pz.identity, 40, 20, yaw=0.6, pitch=0.55, fit=True, distance=7.0, supersample=4, bg=bg)
+    assert smooth.mask.all()                                             # every cell fully specified
+    glyphs = {ch for row in smooth.cells() for text, _, _ in row for ch in text}
+    assert glyphs <= {" ", "▀"}                                          # no lower half blocks needed
+    assert tuple(int(v) for v in smooth.color[0, 0]) == bg               # corners are pure background
+    assert smooth.cells()[0] == [(" " * 40, None, None)]                 # ... and stay unstyled (no box)
+    colours = {tuple(c) for c in smooth.color.reshape(-1, 3).tolist()}
+    assert len(colours) > 3 * len({tuple(c) for c in fitted.color[fitted.mask].tolist()})   # blended edges
+    # cell aspect: taller cells need fewer rows for the same shape
+    tall = r.render_3d(pz.identity, 40, 20, yaw=0.6, pitch=0.55, fit=True, distance=7.0, cell_aspect=3.0)
+    rows = lambda f: int(f.mask.any(axis=1).sum())
+    assert rows(tall) < rows(r.render_3d(pz.identity, 40, 20, yaw=0.6, pitch=0.55, fit=True, distance=7.0, cell_aspect=3.0 / 1.5))
+    # the turning layer is a closed solid: both halves get a cap on the cutting plane
+    for name in ("cube3", "megaminx", "pyraminx", "skewb"):
+        rr = get_renderer(get_puzzle(name))
+        static, turning = rr._body_parts(get_puzzle(name).action_names[0])
+        assert len(static) + len(turning) >= len(rr.body) + 2
+        for part in (static, turning):                                   # closed: every edge is shared by two faces
+            edges: dict = {}
+            for face in part:
+                for i in range(len(face)):
+                    a, b = np.round(face[i], 5), np.round(face[(i + 1) % len(face)], 5)
+                    key = tuple(sorted((tuple(a), tuple(b))))
+                    edges[key] = edges.get(key, 0) + 1
+            assert set(edges.values()) == {2}
+    assert get_renderer(get_puzzle("fifteen"))._body_parts("U") is None      # planar puzzles have no layers
+    s = Session("cube3", device="cpu")
+    st = s.set_style(bg="#282c34", aspect=2.15, quality=4, pitch=0.5)
+    assert st == dict(bg="#282c34", aspect=2.15, quality=4, pitch=0.5, zoom=1.0)
+    assert s.render(30, 15).mask.all() and s.set_style(bg="none")["bg"] is None
+    with pytest.raises(ValueError):
+        s.set_style(bg="blue")

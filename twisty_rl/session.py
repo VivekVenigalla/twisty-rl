@@ -43,12 +43,13 @@ class Session:
         self.last_result: Optional[SearchResult] = None
         self.mined: list = []
         # camera
-        self.yaw, self.pitch, self.zoom = 0.6, 0.45, 1.0
+        self.yaw, self.pitch, self.zoom = 0.6, 0.55, 1.0
         self.spin = True
         self.spin_speed = 0.6
         self._spin_t0 = time.monotonic()
         # look of the 3D view: anti-aliasing level, known background colour, cell height / width
-        self.quality = 3
+        self.quality = 4
+        self.camera_distance = 7.0          # far camera: nearly parallel edges read cleaner at low resolution
         self.background: Optional[tuple[int, int, int]] = None
         self.cell_aspect = 2.0
         # timed move playback (smooth layer turns for clients that only poll frames)
@@ -515,7 +516,8 @@ class Session:
         if view == "net":
             return r.render_net(st, width, height)
         return r.render_3d(st, width, height, yaw=self.camera_yaw(), pitch=self.pitch, zoom=self.zoom, anim=anim,
-                           supersample=self.quality, bg=self.background, cell_aspect=self.cell_aspect)
+                           supersample=self.quality, bg=self.background, cell_aspect=self.cell_aspect,
+                           fit=True, distance=self.camera_distance)
 
     def status(self) -> dict:
         res = self.last_result
