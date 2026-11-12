@@ -511,6 +511,7 @@ class PuzzleGroup:
             self.anchor_paths: dict[int, np.ndarray] = {0: puzzle.identity}
             self.anchor_words: dict[int, tuple[int, ...]] = {0: ()}
             gens = puzzle.primitive_generators
+            self.generator_words: list[tuple[int, ...]] = [(a,) for a in range(puzzle.num_primitive)]
         else:
             gens = self._vertex_group_generators()
         self.bsgs = BSGS(self.n, gens, base_order=pref, seed=seed, deterministic=deterministic)
@@ -549,6 +550,7 @@ class PuzzleGroup:
                     queue.append(k2)
         self.anchor_paths, self.anchor_words = paths, words
         loops: dict[bytes, np.ndarray] = {}
+        loop_words: dict[bytes, tuple[int, ...]] = {}
         for k, Tk in paths.items():
             for a in range(pz.num_primitive):
                 if not pz.legal[a, k]:
@@ -557,7 +559,11 @@ class PuzzleGroup:
                 k2 = int(np.nonzero(m == k)[0][0])
                 loop = Tk[m][invert_perm(paths[k2])]
                 if not np.array_equal(loop, pz.identity):
-                    loops.setdefault(loop.tobytes(), loop)
+                    key = loop.tobytes()
+                    word = words[k] + (a,) + tuple(int(pz.inverse[x]) for x in reversed(words[k2]))
+                    if key not in loops or len(word) < len(loop_words[key]):
+                        loops[key], loop_words[key] = loop, word
+        self.generator_words = [loop_words[key] for key in loops]
         return list(loops.values())
 
     # -- sizes --------------------------------------------------------------------------
@@ -607,6 +613,125 @@ class PuzzleGroup:
             P = lookup[colors]
             return P if self.contains_state(P) else None
         return self.bsgs.find_coloring_element(self.color, colors, budget=budget)
+
+    def diagnose_colors(self, colors: Sequence[int], budget: int = 200_000) -> dict:
+        """Explain a colouring: ``{"solvable", "reason", "state"}``.
+
+        Unsolvable colourings are classified by trying the classic single defects -- a flipped
+        two-sticker piece, a twisted three-sticker piece, two swapped pieces and their combinations --
+        and reporting the first repair after which Schreier-Sims accepts the state.
+        """
+        pz = self.puzzle
+        names = pz.spec.color_names
+        colors = np.asarray(colors, dtype=np.intp).reshape(-1)
+        if colors.shape != (self.n,):
+            return dict(solvable=False, state=None, reason=f"expected {self.n} stickers, got {colors.size}")
+        if colors.min() < 0 or colors.max() >= pz.num_colors:
+            return dict(solvable=False, state=None, reason="unknown colour index")
+        need = np.bincount(self.color, minlength=pz.num_colors)
+        got = np.bincount(colors, minlength=pz.num_colors)
+        if not np.array_equal(need, got):
+            bad = [f"{names[c]}: {got[c]} instead of {need[c]}" for c in range(pz.num_colors) if need[c] != got[c]]
+            return dict(solvable=False, state=None, reason="wrong number of stickers per colour (" + ", ".join(bad) + ")")
+
+        def reach(cols: np.ndarray) -> Optional[np.ndarray]:
+            try:
+                return self.state_from_colors(cols, budget)
+            except SearchBudgetExceeded:
+                return None
+
+        P = reach(colors)
+        if P is not None:
+            return dict(solvable=True, state=P, reason="")
+        if not pz.is_group:
+            return dict(solvable=False, state=None,
+                        reason="this arrangement has the wrong parity: exactly half of all arrangements are reachable")
+        pieces = [np.nonzero(pz.piece_of == i)[0] for i in range(pz.num_pieces)]
+        want: dict[tuple, int] = {}
+        have: dict[tuple, int] = {}
+        for facets in pieces:
+            want[tuple(sorted(self.color[facets].tolist()))] = want.get(tuple(sorted(self.color[facets].tolist())), 0) + 1
+            have[tuple(sorted(colors[facets].tolist()))] = have.get(tuple(sorted(colors[facets].tolist())), 0) + 1
+        for sig, cnt in have.items():
+            if cnt > want.get(sig, 0):
+                label = "/".join(names[c] for c in sig)
+                why = "does not exist on this puzzle" if sig not in want else "appears more often than it exists"
+                return dict(solvable=False, state=None, reason=f"a piece with stickers {label} {why}")
+        allowed = self._piece_placements()
+        for facets in pieces:                                # right stickers, impossible arrangement on the piece
+            if len(facets) > 1 and tuple(colors[facets].tolist()) not in allowed[tuple(facets.tolist())]:
+                label = "/".join(names[c] for c in colors[facets])
+                kind = pz.piece_kind[int(pz.piece_of[facets[0]])]
+                return dict(solvable=False, state=None,
+                            reason=f"the {kind} showing {label} has its stickers in mirrored order, "
+                                   "which no real piece can show (two of its stickers are exchanged)")
+        # single-defect repairs
+        prim = pz.table[: pz.num_primitive, 0]
+        moved = (prim != pz.identity[None, :]).any(axis=0)
+        repairs: list[tuple[str, list]] = []
+        for size, label in ((2, "is flipped"), (3, "is twisted")):
+            cand = [f for f in pieces if len(f) == size and moved[f].all()]
+            if cand:
+                f = cand[0]
+                kind = pz.piece_kind[int(pz.piece_of[f[0]])]
+                shifts = [1] if size == 2 else [1, 2]
+                repairs.append((f"one {kind} {label}", [(f, np.roll(f, s)) for s in shifts]))
+        seen_kinds: set[str] = set()
+        for facets in pieces:
+            kind = pz.piece_kind[int(pz.piece_of[facets[0]])]
+            if kind in seen_kinds or not moved[facets].all():
+                continue
+            for m in prim:                                   # a generator carries this piece onto a neighbour
+                src = m[facets]
+                if pz.piece_of[src[0]] != pz.piece_of[facets[0]] and len(set(pz.piece_of[src].tolist())) == 1:
+                    seen_kinds.add(kind)
+                    both = np.concatenate([facets, src])
+                    repairs.append((f"two {kind}s are swapped (or an equivalent parity error)",
+                                    [(both, np.concatenate([src, facets]))]))
+                    break
+
+        def apply(cols: np.ndarray, option) -> np.ndarray:
+            out = cols.copy()
+            out[option[0]] = cols[option[1]]
+            return out
+
+        import itertools
+        for r in range(1, min(3, len(repairs)) + 1):
+            for combo in itertools.combinations(range(len(repairs)), r):
+                for choice in itertools.product(*[repairs[i][1] for i in combo]):
+                    fixed = colors
+                    for option in choice:
+                        fixed = apply(fixed, option)
+                    if reach(fixed) is not None:
+                        what = " and ".join(repairs[i][0] for i in combo)
+                        return dict(solvable=False, state=None,
+                                    reason=f"all pieces exist, but {what}; a real puzzle cannot reach this "
+                                           "(re-check those stickers, or the puzzle was reassembled)")
+        return dict(solvable=False, state=None, reason="all pieces exist, but this arrangement is not reachable")
+
+    def _piece_placements(self) -> dict[tuple, set]:
+        """For every piece position, the sticker colourings (in facet order) some real piece can show there."""
+        if getattr(self, "_placements", None) is None:
+            pz = self.puzzle
+            inv = np.argsort(pz.table[: pz.num_primitive, 0], axis=-1)
+            allowed: dict[tuple, set] = {}
+            for i in range(pz.num_pieces):
+                home = np.nonzero(pz.piece_of == i)[0]
+                cols = self.color[home]
+                seen = {tuple(home.tolist())}
+                stack = [home]
+                while stack:
+                    where = stack.pop()                       # current positions of the piece's facets
+                    order = np.argsort(where)
+                    allowed.setdefault(tuple(where[order].tolist()), set()).add(tuple(cols[order].tolist()))
+                    for m in inv:
+                        nxt = m[where]
+                        key = tuple(nxt.tolist())
+                        if key not in seen:
+                            seen.add(key)
+                            stack.append(nxt)
+            self._placements = allowed
+        return self._placements
 
     def is_solvable(self, state: np.ndarray, colors: bool = False) -> bool:
         """Exact reachability test; ``colors=True`` interprets ``state`` as a colour state."""

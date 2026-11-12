@@ -27,6 +27,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from twisty_rl.adversarial import PAIREDConfig, PAIREDTrainer  # noqa: E402
+from twisty_rl.chain_solver import ChainSolver  # noqa: E402
 from twisty_rl.emacs_bridge import BridgeClient, DaemonThread, RpcError, TwistyDaemon  # noqa: E402
 from twisty_rl.env import TensorPuzzle, TwistyGymEnv, TwistyVectorEnv, VecPuzzleEnv  # noqa: E402
 from twisty_rl.graph_compiler import compile_graph, macro_edge_count, spectral_encodings, topology_adjacency  # noqa: E402
@@ -735,7 +736,8 @@ def test_unsolvable_states_are_rejected_before_search():
     res = s.solve()
     assert not res.solved and "unsolvable" in res.reason and res.nodes_generated == 0
     flipped_colors = s.puzzle.colors(bad)
-    assert s.set_colors(flipped_colors.tolist()) is False
+    verdict = s.set_colors(flipped_colors.tolist())
+    assert verdict["accepted"] is False and "edge is flipped" in verdict["reason"]
 
 
 # ======================================================================================
@@ -1174,3 +1176,152 @@ def test_clean_terminal_look():
     assert s.render(30, 15).mask.all() and s.set_style(bg="none")["bg"] is None
     with pytest.raises(ValueError):
         s.set_style(bg="blue")
+
+
+# ======================================================================================
+# Any-scramble solver, sticker diagnosis, paint layout, carousel
+# ======================================================================================
+@lru_cache(maxsize=None)
+def chain(name: str) -> ChainSolver:
+    return ChainSolver(group(name)).build(time_budget=4.0)
+
+
+@pytest.mark.parametrize("name", ["cube2", "cube3", "pyraminx", "skewb", "fifteen", "eight", "pancake",
+                                  "lights_out3", "rubiks_clock"])
+def test_chain_solver_solves_every_random_state(name):
+    pz, grp, cs = get_puzzle(name), group(name), chain(name)
+    assert cs.complete and (cs.has.sum(axis=1) == np.asarray(grp.bsgs.orbit_sizes)).all()
+    for lvl in range(cs.k):                                   # every table word does what the table claims
+        for gamma, word in list(cs.words[lvl].items())[:6]:
+            perm = cs._word_perm(word)
+            assert perm[cs.base[lvl]] == gamma and (perm[cs.base[:lvl]] == cs.base[:lvl]).all()
+            assert np.array_equal(perm, cs.tperm[lvl, gamma])
+    rng = np.random.default_rng(11)
+    for _ in range(12):
+        P = grp.random_state(rng)
+        word = cs.solve(P, tries=8)
+        assert all(a < pz.num_primitive for a in word)
+        assert pz.is_solved(pz.apply_word(P, word))
+        assert len(word) <= len(cs._solve_once(P))
+    assert cs.solve(pz.identity) == []
+    bad = pz.identity.copy()
+    bad[[0, 1]] = bad[[1, 0]]
+    if not grp.contains_state(bad):
+        with pytest.raises(ValueError):
+            cs._solve_once(bad)
+
+
+def test_chain_solver_cache_roundtrip(tmp_path):
+    grp = group("pyraminx")
+    a = ChainSolver.cached(grp, time_budget=2.0, cache_dir=tmp_path)
+    files = list(tmp_path.glob("chain-pyraminx-*.npz"))
+    assert len(files) == 1
+    b = ChainSolver.cached(grp, time_budget=2.0, cache_dir=tmp_path)
+    assert b.complete and b.words == a.words and np.array_equal(a.tperm, b.tperm)
+    files[0].write_bytes(b"corrupt")                          # a damaged cache is rebuilt, not trusted
+    assert ChainSolver.cached(grp, time_budget=2.0, cache_dir=tmp_path).complete
+
+
+def test_word_reduction_and_notation():
+    pz = get_puzzle("cube3")
+    U, D, R = (pz.action_index(x) for x in "UDR")
+    Ui, Ri = pz.action_index("U'"), pz.action_index("R'")
+    assert pz.reduce_word([U, Ui]) == [] and pz.reduce_word([U, U, U]) == [Ui] and pz.reduce_word([U] * 4) == []
+    assert pz.reduce_word([U, D, Ui]) == [D]                 # U and D commute
+    assert pz.reduce_word([U, R, Ui]) == [U, R, Ui]          # U and R do not
+    assert pz.reduce_word([R, U, U, D, U, U, Ri]) == [R, D, Ri]
+    rng = np.random.default_rng(0)
+    for _ in range(50):
+        w = rng.integers(0, pz.num_primitive, size=30).tolist()
+        r = pz.reduce_word(w)
+        assert len(r) <= len(w) and np.array_equal(pz.apply_word(pz.identity, w), pz.apply_word(pz.identity, r))
+    assert pz.format_moves([U, U, R, Ri, Ri, D]) == ["U2", "R", "R2'", "D"]
+    assert pz.parse_moves("U2 R R2' D") == [U, U, R, Ri, Ri, D]
+    fz = get_puzzle("fifteen")
+    u, d, l = fz.action_index("U"), fz.action_index("D"), fz.action_index("L")
+    assert fz.reduce_word([u, d, l]) == [l] and fz.reduce_word([u, l, d]) == [u, l, d]
+    assert get_puzzle("pancake").parse_moves("F2 F3") == [0, 1]          # names that end in digits still win
+
+
+def test_sticker_diagnosis_names_the_defect():
+    pz, grp = get_puzzle("cube3"), group("cube3")
+    rng = np.random.default_rng(3)
+    P = grp.random_state(rng)
+    C = pz.colors(P)
+    good = grp.diagnose_colors(C)
+    assert good["solvable"] and np.array_equal(pz.colors(good["state"]), C)
+    loc = lambda fs: np.array([int(np.nonzero(P == f)[0][0]) for f in fs])
+    edges = [loc(p.facets) for p in pz.spec.pieces if p.kind == "edge"]
+    corners = [loc(p.facets) for p in pz.spec.pieces if p.kind == "corner"]
+    def reason(mutate):
+        x = C.copy()
+        mutate(x)
+        d = grp.diagnose_colors(x)
+        assert not d["solvable"] and d["state"] is None
+        return d["reason"]
+    assert "one edge is flipped" in reason(lambda x: x.__setitem__(edges[4], C[edges[4][::-1]]))
+    assert "one corner is twisted" in reason(lambda x: x.__setitem__(corners[1], C[np.roll(corners[1], 1)]))
+    def swap(x):
+        x[edges[2]], x[edges[9]] = C[edges[9]], C[edges[2]]
+    assert "swapped" in reason(swap)
+    def both(x):
+        x[edges[4]] = C[edges[4][::-1]]
+        x[corners[6]] = C[np.roll(corners[6], 2)]
+    r = reason(both)
+    assert "edge is flipped" in r and "corner is twisted" in r
+    assert "mirrored" in reason(lambda x: x.__setitem__(corners[3], C[corners[3][[1, 0, 2]]]))
+    def recolour(x):
+        i = int(np.nonzero(C != C[0])[0][0])
+        x[0] = C[i]
+    assert "wrong number of stickers" in reason(recolour)
+    assert "expected 54" in grp.diagnose_colors(C[:10])["reason"]
+    fz, fg = get_puzzle("fifteen"), group("fifteen")
+    S = fz.identity.copy()
+    S[[13, 14]] = S[[14, 13]]
+    assert "parity" in fg.diagnose_colors(fz.colors(S))["reason"]
+
+
+def test_session_solves_deep_scrambles_and_paints():
+    s = Session("cube3", device="cpu")
+    s.astar_patience = 0.5
+    s.state = s.group.random_state(np.random.default_rng(1))
+    res = s.solve()                                           # too deep for the pattern databases -> chain solver
+    assert res.solved and not res.optimal_proven and "chain" in res.reason
+    assert s.puzzle.is_solved(s.puzzle.apply_word(s.state, res.primitive_path))
+    s.scramble(4)
+    shallow = s.solve()
+    assert shallow.solved and shallow.optimal_proven and len(shallow.moves) <= 4
+    assert s.solve(method="chain").solved
+    lay = s.paint_layout()
+    assert len(lay["cells"]) == 54 and len({tuple(c) for c in lay["cells"]}) == 54
+    assert lay["keys"] == ["w", "y", "g", "b", "r", "o"] and lay["need"] == [9] * 6
+    assert sum(lay["fixed"]) == 6 and lay["rows"] <= 16 and lay["cols"] <= 12
+    for name in ("megaminx", "pyraminx", "cube4", "fifteen"):
+        s.set_puzzle(name)
+        lay = s.paint_layout()
+        assert len({tuple(c) for c in lay["cells"]}) == s.puzzle.n and len(set(lay["keys"])) == s.puzzle.num_colors
+    # per-puzzle objects survive switching away and back
+    s.set_puzzle("cube3")
+    g1 = s.group
+    s.set_puzzle("pyraminx")
+    s.set_puzzle("cube3")
+    assert s.group is g1 and s.telemetry.get("group_order") == "4.32e19"
+
+
+def test_attract_carousel_rotates_puzzles():
+    import time as _time
+    s = Session("cube2", device="cpu")
+    with pytest.raises(ValueError):
+        s.set_show("attract", carousel=["cube2", "nope"])
+    s.set_show("attract", depth=3, pause=0.02, move_time=0.005, carousel=["cube2", "pyraminx", "skewb"])
+    seen = []
+    t0 = _time.monotonic()
+    while _time.monotonic() - t0 < 40 and len(seen) < 4:
+        s.render(12, 6)
+        if not seen or seen[-1] != s.puzzle.name:
+            seen.append(s.puzzle.name)
+        _time.sleep(0.002)
+    assert seen[:4] == ["cube2", "pyraminx", "skewb", "cube2"]
+    assert s.show_status()["carousel"] == ["cube2", "pyraminx", "skewb"]
+    s.set_show(carousel=[])
+    assert s.show_status()["carousel"] == []

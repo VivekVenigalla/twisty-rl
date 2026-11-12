@@ -18,7 +18,7 @@ from .puzzles import list_puzzles
 from .session import Session
 
 PROTOCOL_VERSION = "1.0"
-HEAVY = {"solve", "group_info", "mine_macros", "set_puzzle", "is_solvable", "set_colors", "show"}
+HEAVY = {"solve", "group_info", "mine_macros", "set_puzzle", "is_solvable", "set_colors", "show", "paint_layout"}
 
 
 def default_socket_path() -> str:
@@ -81,10 +81,10 @@ class TwistyDaemon:
 
     def rpc_show(self, mode: Optional[str] = None, paused: Optional[bool] = None, depth: Optional[int] = None,
                  pause: Optional[float] = None, move_time: Optional[float] = None,
-                 daily_depth: Optional[int] = None) -> dict:
+                 daily_depth: Optional[int] = None, carousel: Optional[list] = None) -> dict:
         """Idle behaviour: ``spin``, ``attract`` (scramble and solve forever) or ``daily``."""
         try:
-            return self.session.set_show(mode, paused, depth, pause, move_time, daily_depth)
+            return self.session.set_show(mode, paused, depth, pause, move_time, daily_depth, carousel)
         except ValueError as exc:
             raise RpcError(-32602, str(exc)) from None
 
@@ -99,7 +99,12 @@ class TwistyDaemon:
 
     def rpc_scramble(self, depth: int = 20, seed: Optional[int] = None) -> dict:
         self.session.pause_show()
-        return {"scramble": self.session.scramble(int(depth), None if seed is None else int(seed))}
+        moves = self.session.scramble(int(depth), None if seed is None else int(seed))
+        return {"scramble": moves, "text": " ".join(self.session.puzzle.format_moves(moves))}
+
+    def rpc_paint_layout(self) -> dict:
+        """Character-grid layout, palette and colour keys for entering a physical puzzle."""
+        return self.session.paint_layout()
 
     def rpc_state(self) -> dict:
         s = self.session
@@ -108,8 +113,7 @@ class TwistyDaemon:
 
     def rpc_set_colors(self, colors: list[int]) -> dict:
         self.session.pause_show()
-        ok = self.session.set_colors(colors)
-        return {"accepted": ok, "reason": "" if ok else "colouring is not reachable (parity / orientation violation)"}
+        return self.session.set_colors(colors)
 
     def rpc_is_solvable(self) -> dict:
         return {"solvable": self.session.is_solvable()}
@@ -155,7 +159,9 @@ class TwistyDaemon:
         res = self.session.solve(method=method, time_limit=float(time_limit))
         if res.solved and apply:
             self.session.apply(res.moves)
-        return res.to_dict()
+        out = res.to_dict()
+        out["notation"] = self.session.puzzle.format_moves(res.moves)
+        return out
 
     def rpc_cancel(self) -> dict:
         self.session.cancel_search()

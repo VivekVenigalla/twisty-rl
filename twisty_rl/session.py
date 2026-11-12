@@ -15,6 +15,8 @@ from typing import Callable, Optional
 import numpy as np
 import torch
 
+from .chain_solver import ChainSolver
+from .geometry import polygon_centroid
 from .group_theory import MacroMiner, PuzzleGroup
 from .model import ModelConfig, RelationalGraphTransformer, load_checkpoint
 from .puzzles import get_puzzle, list_puzzles
@@ -71,6 +73,13 @@ class Session:
         self._show_thread: Optional[threading.Thread] = None
         self._show_result: Optional[SearchResult] = None
         self._show_scramble: list[str] = []
+        self.show_carousel: list[str] = []
+        self._show_rounds = 0
+        self.show_max_play = 30.0           # seconds a long (chain-solver) solution may take to play back
+        self.astar_patience = 3.0           # seconds "auto" searches for an optimal answer before falling back
+        # heavy per-puzzle objects survive puzzle switches (carousel, coming back to a puzzle)
+        self._per_puzzle: dict[str, dict] = {}
+        self._build_lock = threading.Lock()
         self.set_puzzle(puzzle)
 
     # -- puzzle management ------------------------------------------------------------------
@@ -82,27 +91,54 @@ class Session:
             self.state = self.puzzle.identity.copy()
             self.history: list[str] = []
             self.scramble_moves: list[str] = []
-            self._group: Optional[PuzzleGroup] = None
-            self._pdbs = None
             self._solver_cache: dict = {}
             self.trainer = None
             self.mined = []
             self.last_result = None
             self._clear_play()
             self._show_phase, self._show_until, self.show_caption = "pause", time.monotonic() + 0.8, ""
+            known = self._per_puzzle.get(self.base_puzzle.name, {}).get("group")
             self.telemetry.set(puzzle=self.puzzle.name, facets=self.puzzle.n, actions=self.puzzle.num_actions,
-                               group_order="…", macros=[])
+                               group_order="…" if known is None else human_int(known.num_states), macros=[])
             self.telemetry.event(f"loaded {self.puzzle.name}: {self.puzzle.spec.description}")
+
+    def _built(self, puzzle: Puzzle, key: str, build: Callable[[], object]):
+        """Per-puzzle lazily built object.  Building never holds the state lock, so frames keep flowing."""
+        entry = self._per_puzzle.setdefault(puzzle.name, {})
+        if key not in entry:
+            with self._build_lock:
+                if key not in entry:
+                    entry[key] = build()
+        return entry[key]
+
+    def _group_for(self, puzzle: Puzzle) -> PuzzleGroup:
+        def build() -> PuzzleGroup:
+            t0 = time.perf_counter()
+            g = PuzzleGroup(puzzle)
+            if puzzle is self.base_puzzle:
+                self.telemetry.set(group_order=human_int(g.num_states), bsgs_base=len(g.bsgs.base),
+                                   bsgs_time=time.perf_counter() - t0)
+            return g
+        return self._built(puzzle, "group", build)
 
     @property
     def group(self) -> PuzzleGroup:
-        with self._lock:
-            if self._group is None:
-                t0 = time.perf_counter()
-                self._group = PuzzleGroup(self.base_puzzle)
-                self.telemetry.set(group_order=human_int(self._group.num_states), bsgs_base=len(self._group.bsgs.base),
-                                   bsgs_time=time.perf_counter() - t0)
-            return self._group
+        return self._group_for(self.base_puzzle)
+
+    def _chain_for(self, puzzle: Puzzle) -> ChainSolver:
+        group = self._group_for(puzzle)
+
+        def build() -> ChainSolver:
+            t0 = time.perf_counter()
+            chain = ChainSolver.cached(group)
+            self.telemetry.event(f"stabiliser-chain solver for {puzzle.name} ready in {time.perf_counter() - t0:.1f}s "
+                                 f"(expected solution length {chain.expected_length():.0f})")
+            return chain
+        return self._built(puzzle, "chain", build)
+
+    def chain(self) -> ChainSolver:
+        """The always-terminating solver of the current puzzle (built or loaded from disk on first use)."""
+        return self._chain_for(self.base_puzzle)
 
     def group_info(self) -> dict:
         g = self.group
@@ -171,48 +207,106 @@ class Session:
             self.state = np.asarray(P, dtype=np.intp).copy()
             self.history.clear()
 
-    def set_colors(self, colors) -> bool:
-        """Load a colour state; returns ``False`` (state unchanged) when it is unsolvable."""
-        P = self.group.state_from_colors(np.asarray(colors, dtype=np.intp))
-        if P is None:
-            return False
-        self.set_state(P)
-        return True
+    def set_colors(self, colors) -> dict:
+        """Load a colour state -> ``{"accepted", "reason"}``; an unsolvable one leaves the state alone."""
+        verdict = self.group.diagnose_colors(colors)
+        if verdict["solvable"]:
+            self.set_state(verdict["state"])
+        return {"accepted": bool(verdict["solvable"]), "reason": verdict["reason"]}
+
+    def paint_layout(self) -> dict:
+        """Everything a client needs to let the user paint a physical puzzle onto a character grid."""
+        pz = self.base_puzzle
+        geom = pz.spec.geometry
+        cent = np.array([polygon_centroid(np.asarray(p, dtype=np.float64)) for p in geom.polygons2d])
+        if pz.spec.family == "polyhedral":                # pull the faces one cell apart
+            centre = cent.mean(axis=0)
+            for c in range(pz.num_colors):
+                sel = pz.solved_colors == c
+                cent[sel] += (cent[sel].mean(axis=0) - centre) / 3.0
+        x, y = cent[:, 0] - cent[:, 0].min(), cent[:, 1].max() - cent[:, 1]
+        scale, cells = 0.4, None
+        while scale < 40:
+            cand = np.stack([np.round(y * scale), np.round(x * scale)], axis=1).astype(int)
+            if len({(int(r), int(c)) for r, c in cand}) == pz.n or cand[:, 0].max() > 34 or cand[:, 1].max() > 44:
+                cells = cand
+                break
+            scale *= 1.07
+        taken: set[tuple[int, int]] = set()
+        out = []
+        for r, c in cells.tolist():                       # dense nets: nudge collisions to the nearest free cell
+            radius = 0
+            while (r, c) in taken:
+                radius += 1
+                ring = [(r + dr, c + dc) for dr in range(-radius, radius + 1) for dc in range(-radius, radius + 1)
+                        if max(abs(dr), abs(dc)) == radius and r + dr >= 0 and c + dc >= 0]
+                free = [q for q in ring if q not in taken]
+                if free:
+                    r, c = min(free, key=lambda q: (q[0] - r) ** 2 + (q[1] - c) ** 2)
+            taken.add((r, c))
+            out.append([r, c])
+        prim = pz.table[: pz.num_primitive]
+        fixed = ~(prim != pz.identity[None, None, :]).any(axis=(0, 1))
+        named = {"w": (245, 245, 245), "y": (255, 213, 0), "g": (0, 158, 96), "b": (0, 81, 186), "r": (196, 30, 58),
+                 "o": (255, 120, 20), "p": (128, 0, 160), "k": (255, 150, 190), "c": (250, 240, 180),
+                 "s": (100, 190, 255), "l": (120, 220, 120), "a": (150, 150, 150), "d": (40, 40, 48)}
+        palette = [tuple(c) for c in pz.spec.palette[: pz.num_colors]]
+        letters = [min(named, key=lambda k: sum((a - b) ** 2 for a, b in zip(named[k], col))) for col in palette]
+        if len(set(letters)) != len(letters):
+            letters = list("123456789abcdefghijklmnoprstuvwxyz"[: len(palette)])
+        return dict(puzzle=pz.name, rows=int(max(r for r, _ in out)) + 1, cols=int(max(c for _, c in out)) + 1,
+                    cells=out, colors=self.colors(), fixed=fixed.tolist(), keys=letters,
+                    palette=["#%02x%02x%02x" % c for c in palette], names=list(pz.spec.color_names[: pz.num_colors]),
+                    need=np.bincount(pz.solved_colors, minlength=pz.num_colors).tolist())
 
     def colors(self) -> list[int]:
         return self.puzzle.colors(self.state).tolist()
 
     # -- search -----------------------------------------------------------------------------------
+    def _pdbs_for(self, puzzle: Puzzle):
+        group = self._group_for(puzzle)
+
+        def build():
+            budget = 300_000 if puzzle.n <= 60 else 60_000
+            t0 = time.perf_counter()
+            pdbs = build_pdbs(puzzle, max_entries=budget, count=2, device=self.device, group=group)
+            self.telemetry.event(f"built {len(pdbs)} pattern databases for {puzzle.name} "
+                                 f"({sum(p.size for p in pdbs):,} entries, {time.perf_counter() - t0:.1f}s)")
+            return pdbs
+        return self._built(puzzle, "pdbs", build)
+
     def pdbs(self):
-        with self._lock:
-            if self._pdbs is None:
-                budget = 300_000 if self.base_puzzle.n <= 60 else 60_000
-                t0 = time.perf_counter()
-                self._pdbs = build_pdbs(self.base_puzzle, max_entries=budget, count=2, device=self.device,
-                                        group=self.group)
-                self.telemetry.event(f"built {len(self._pdbs)} pattern databases "
-                                     f"({sum(p.size for p in self._pdbs):,} entries, {time.perf_counter() - t0:.1f}s)")
-            return self._pdbs
+        return self._pdbs_for(self.base_puzzle)
 
     def solve(self, method: str = "auto", time_limit: float = 20.0, weight: Optional[float] = None,
               use_model: Optional[bool] = None, quiet: bool = False) -> SearchResult:
-        """Search for a solution of the current state (does not modify it)."""
+        """Find a solution of the current state (does not modify it).
+
+        ``method``: ``astar`` / ``beam`` search, ``chain`` uses the stabiliser-chain solver (always
+        succeeds, not optimal) and ``auto`` searches for ``astar_patience`` seconds, then falls back
+        to the chain solver.
+        """
         with self._lock:
             state = self.state.copy()
             puzzle = self.puzzle
-        if not self.group.contains_state(state):
+            base = self.base_puzzle
+        if not self._group_for(base).contains_state(state):
             res = SearchResult(solved=False, reason="unsolvable: state is not in the puzzle group")
             self.last_result = res
             if not quiet:
                 self.telemetry.event(res.reason)
             return res
         self._cancel_search.clear()
-        pdbs = self.pdbs()
-        have_model = self.model is not None and self.base_puzzle.name in self.model_trained_on
+        if method == "chain":
+            return self._finish_solve(self._chain_solve(base, state), quiet)
+        pdbs = self._pdbs_for(base)
+        have_model = self.model is not None and base.name in self.model_trained_on
         use_model = have_model if use_model is None else (use_model and self.model is not None)
-        if method == "auto":
+        auto = method == "auto"
+        if auto:
             method = "astar"
-        key = (puzzle.num_actions, method, use_model, weight)
+            time_limit = min(time_limit, self.astar_patience)
+        key = (puzzle.name, puzzle.num_actions, method, use_model, weight)
         solver = self._solver_cache.get(key)
         if solver is None:
             w = weight if weight is not None else (1.4 if use_model else 1.0)
@@ -222,6 +316,21 @@ class Session:
                                  batch_size=256 if use_model else 1024, **kwargs)
             self._solver_cache = {key: solver}
         res = solver.solve(state, time_limit=time_limit, should_stop=self._cancel_search.is_set)
+        if auto and not res.solved and not self._cancel_search.is_set():
+            searched = res
+            res = self._chain_solve(base, state)
+            res.nodes_expanded, res.nodes_generated = searched.nodes_expanded, searched.nodes_generated
+            res.elapsed += searched.elapsed
+        return self._finish_solve(res, quiet)
+
+    def _chain_solve(self, base: Puzzle, state: np.ndarray) -> SearchResult:
+        t0 = time.perf_counter()
+        word = self._chain_for(base).solve(state)
+        return SearchResult(solved=True, path=list(word), primitive_path=list(word), moves=base.names_of(word),
+                            cost=float(len(word)), elapsed=time.perf_counter() - t0,
+                            reason="stabiliser-chain solver (always finishes, not optimal)")
+
+    def _finish_solve(self, res: SearchResult, quiet: bool) -> SearchResult:
         self.last_result = res
         self.telemetry.set(last_solution=" ".join(res.moves) if res.solved else "", last_solution_len=len(res.moves),
                            search_nodes=res.nodes_generated)
@@ -374,11 +483,24 @@ class Session:
     # -- idle show --------------------------------------------------------------------------------
     def set_show(self, mode: Optional[str] = None, paused: Optional[bool] = None, depth: Optional[int] = None,
                  pause: Optional[float] = None, move_time: Optional[float] = None,
-                 daily_depth: Optional[int] = None) -> dict:
-        """Configure what the puzzle does while idle (see :data:`SHOW_MODES`)."""
+                 daily_depth: Optional[int] = None, carousel: Optional[list] = None) -> dict:
+        """Configure what the puzzle does while idle (see :data:`SHOW_MODES`).
+
+        ``carousel`` is a list of puzzle names the attract show rotates through, one per round
+        (an empty list stays on the current puzzle).
+        """
         if mode is not None and mode not in SHOW_MODES:
             raise ValueError(f"unknown show mode {mode!r}; choose from {', '.join(SHOW_MODES)}")
+        if carousel is not None:
+            try:
+                for name in carousel:
+                    get_puzzle(name)
+            except KeyError as exc:
+                raise ValueError(str(exc)) from None
         with self._lock:
+            if carousel is not None:
+                self.show_carousel = [str(n) for n in carousel]
+                self._show_rounds = 0
             if depth is not None:
                 self.show_depth = max(1, int(depth))
             if daily_depth is not None:
@@ -409,7 +531,8 @@ class Session:
 
     def show_status(self) -> dict:
         return dict(mode=self.show_mode, paused=self.show_paused, phase=self._show_phase,
-                    caption=self.show_caption, queued=len(self._play_queue) + (self._play_current is not None))
+                    caption=self.show_caption, queued=len(self._play_queue) + (self._play_current is not None),
+                    carousel=list(self.show_carousel))
 
     def _show_tick(self, now: float) -> None:
         """Attract-mode state machine, advanced whenever a frame is rendered."""
@@ -419,7 +542,17 @@ class Session:
         if phase == "pause":
             if now < self._show_until:
                 return
+            if self.show_carousel and self._show_rounds > 0 and not self.training:
+                names = self.show_carousel
+                cur = self.base_puzzle.name
+                nxt = names[(names.index(cur) + 1) % len(names)] if cur in names else names[0]
+                self._show_rounds = 0
+                if nxt != cur:
+                    self.set_puzzle(nxt)                  # restarts the pause; the next tick scrambles it
+                    self._show_until = now + 0.3
+                    return
             with self._lock:
+                self._show_rounds += 1
                 self._clear_play()
                 self.state = self.puzzle.identity.copy()
                 _, actions = self.puzzle.scramble(self.rng, self.show_depth)
@@ -436,7 +569,7 @@ class Session:
 
             def work() -> None:
                 try:
-                    self._show_result = self.solve(time_limit=self.show_time_limit, quiet=True)
+                    self._show_result = self.solve(method="auto", time_limit=self.show_time_limit, quiet=True)
                 except Exception as exc:                                  # shown in the caption below
                     self._show_result = SearchResult(solved=False, reason=f"{type(exc).__name__}: {exc}")
 
@@ -453,14 +586,17 @@ class Session:
                     return
                 if res is not None and res.solved:
                     moves = res.moves
-                    self.show_caption = (f"solved in {len(moves)} moves" + (" (optimal)" if res.optimal_proven else "")
-                                         + f": {' '.join(moves)}  ·  {res.nodes_generated:,} nodes in {res.elapsed:.2f}s")
+                    text = " ".join(self.base_puzzle.format_moves(moves))
+                    self.show_caption = (
+                        f"solved in {len(moves)} moves (optimal): {text}  ·  {res.nodes_generated:,} nodes in {res.elapsed:.2f}s"
+                        if res.optimal_proven else f"solved in {len(moves)} moves (chain solver): {text}")
                 else:
                     inv = self.puzzle.inverse
                     moves = self.puzzle.names_of(
                         [int(inv[self.puzzle.action_index(n)]) for n in reversed(self._show_scramble)])
                     self.show_caption = "search budget exceeded, undoing the scramble: " + " ".join(moves)
-                self._play_queue.extend((n, self.move_time) for n in moves)
+                dur = max(0.04, min(self.move_time, self.show_max_play / max(len(moves), 1)))
+                self._play_queue.extend((n, dur) for n in moves)
                 self._show_phase = "playing"
         elif phase == "playing":
             if self.playing:
@@ -507,12 +643,13 @@ class Session:
 
     def render(self, width: int = 48, height: int = 24, view: str = "3d",
                anim: Optional[tuple[str, float]] = None, state: Optional[np.ndarray] = None) -> Frame:
-        r = get_renderer(self.puzzle)
         if state is None and anim is None:
             now = time.monotonic()
-            self._show_tick(now)
+            self._show_tick(now)                          # may switch puzzle (carousel)
             anim = self._advance_play(now)
-        st = self.state if state is None else state
+        with self._lock:
+            r = get_renderer(self.puzzle)
+            st = self.state if state is None else state
         if view == "net":
             return r.render_net(st, width, height)
         return r.render_3d(st, width, height, yaw=self.camera_yaw(), pitch=self.pitch, zoom=self.zoom, anim=anim,
@@ -524,7 +661,8 @@ class Session:
         return dict(
             puzzle=self.puzzle.name, description=self.puzzle.spec.description, facets=self.puzzle.n,
             actions=self.puzzle.action_names, solved=self.is_solved(), moves=len(self.history),
-            history=self.history[-40:], scramble=self.scramble_moves, device=str(self.device),
+            history=self.history[-40:], scramble=self.scramble_moves,
+            scramble_text=" ".join(self.puzzle.format_moves(self.scramble_moves)), device=str(self.device),
             training=self.training, training_mode=self.training_mode,
             model_ready=self.model is not None and self.base_puzzle.name in self.model_trained_on,
             group_order=self.telemetry.get("group_order", "…"),

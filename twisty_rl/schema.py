@@ -18,11 +18,15 @@ Conventions used everywhere in TwistyRL
 from __future__ import annotations
 
 import colorsys
+import re
 from dataclasses import dataclass
 from typing import Optional, Sequence
 
 import numpy as np
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+
+_REPEAT = re.compile(r"^(.+?)(\d+)('?)$")
 
 
 # ----------------------------------------------------------------------------------
@@ -408,6 +412,7 @@ class Puzzle:
         self.piece_kind = piece_kind
         self.num_pieces = nxt
         self._symmetries: Optional[list[tuple[np.ndarray, np.ndarray]]] = None
+        self._reduction = None
 
     # -- construction helpers ---------------------------------------------------------
     def _anchor_dest(self, prim: int, k: int) -> int:
@@ -487,12 +492,85 @@ class Puzzle:
         for tok in toks:
             if tok in self._name_to_action:
                 out.append(self._name_to_action[tok])
-            elif tok.endswith("2") and tok[:-1] in self._name_to_action:
-                out.extend([self._name_to_action[tok[:-1]]] * 2)
             elif tok.endswith("'") and tok[:-1] in self._name_to_action:
                 out.append(int(self.inverse[self._name_to_action[tok[:-1]]]))
             else:
-                raise KeyError(f"unknown move {tok!r} for puzzle {self.name!r}")
+                m = _REPEAT.match(tok)                      # U2, U2', R3 ...
+                base = m and (m.group(1) + m.group(3))
+                if base and base in self._name_to_action:
+                    out.extend([self._name_to_action[base]] * int(m.group(2)))
+                elif m and m.group(3) and m.group(1) in self._name_to_action:
+                    out.extend([int(self.inverse[self._name_to_action[m.group(1)]])] * int(m.group(2)))
+                else:
+                    raise KeyError(f"unknown move {tok!r} for puzzle {self.name!r}")
+        return out
+
+    def format_moves(self, actions: Sequence[int | str]) -> list[str]:
+        """Human notation: runs of one move are written once with a count (``U U`` -> ``U2``)."""
+        names = [a if isinstance(a, str) else self.action_names[a] for a in actions]
+        out: list[str] = []
+        i = 0
+        while i < len(names):
+            j = i
+            while j + 1 < len(names) and names[j + 1] == names[i]:
+                j += 1
+            count, name = j - i + 1, names[i]
+            if count == 1:
+                out.append(name)
+            elif name.endswith("'"):
+                out.append(f"{name[:-1]}{count}'")
+            else:
+                out.append(f"{name}{count}")
+            i = j + 1
+        return out
+
+    def reduce_word(self, word: Sequence[int]) -> list[int]:
+        """Shorten a word without changing its effect.
+
+        Group puzzles: powers of one generator are merged (also across moves that commute with it)
+        and written with the fewest turns.  Conditional puzzles: adjacent inverse pairs cancel.
+        """
+        word = self.expand_to_primitive(word)
+        inv = self.inverse
+        if not self.is_group:
+            out: list[int] = []
+            for a in word:
+                if out and inv[out[-1]] == a:
+                    out.pop()
+                else:
+                    out.append(int(a))
+            return out
+        if self._reduction is None:
+            P = self.num_primitive
+            perms = self._prim_table[:, 0]
+            canon = np.minimum(np.arange(P), inv[:P])
+            order = np.ones(P, dtype=np.intp)
+            for a in range(P):
+                q, k = perms[a], 1
+                while not np.array_equal(q, self.identity):
+                    q, k = q[perms[a]], k + 1
+                order[a] = k
+            commute = np.array([[np.array_equal(perms[a][perms[b]], perms[b][perms[a]]) for b in range(P)]
+                                for a in range(P)])
+            self._reduction = (canon, order, commute)
+        canon, order, commute = self._reduction
+        stack: list[list[int]] = []
+        for a in word:
+            g = int(canon[a])
+            e = 1 if a == g else -1
+            j = len(stack) - 1
+            while j >= 0 and stack[j][0] != g and commute[stack[j][0], g]:
+                j -= 1
+            if j >= 0 and stack[j][0] == g:
+                stack[j][1] = (stack[j][1] + e) % int(order[g])
+                if stack[j][1] == 0:
+                    del stack[j]
+            else:
+                stack.append([g, e % int(order[g])])
+        out = []
+        for g, e in stack:
+            n = int(order[g])
+            out.extend([g] * e if e <= n // 2 else [int(inv[g])] * (n - e))
         return out
 
     def anchor_pos(self, P: np.ndarray) -> int:
