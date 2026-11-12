@@ -6,8 +6,10 @@ macros, train in the background, render.
 """
 from __future__ import annotations
 
+import datetime
 import threading
 import time
+from collections import deque
 from typing import Callable, Optional
 
 import numpy as np
@@ -20,6 +22,8 @@ from .renderer_3d import Frame, get_renderer
 from .schema import Puzzle
 from .search import SearchResult, build_pdbs, make_solver
 from .utils import Telemetry, human_int, pick_device
+
+SHOW_MODES = ("spin", "attract", "daily")
 
 
 class Session:
@@ -43,6 +47,25 @@ class Session:
         self.spin = True
         self.spin_speed = 0.6
         self._spin_t0 = time.monotonic()
+        # timed move playback (smooth layer turns for clients that only poll frames)
+        self._play_queue: deque[tuple[str, float]] = deque()
+        self._play_current: Optional[tuple[str, float]] = None
+        self._play_t0 = 0.0
+        self._play_free_at = 0.0
+        self.move_time = 0.22
+        # idle show: "spin" (nothing), "attract" (scramble + solve forever), "daily" (scramble of the day)
+        self.show_mode = "spin"
+        self.show_paused = False
+        self.show_depth = 9
+        self.show_daily_depth = 20
+        self.show_pause = 2.5
+        self.show_time_limit = 6.0
+        self.show_caption = ""
+        self._show_phase = "pause"
+        self._show_until = 0.0
+        self._show_thread: Optional[threading.Thread] = None
+        self._show_result: Optional[SearchResult] = None
+        self._show_scramble: list[str] = []
         self.set_puzzle(puzzle)
 
     # -- puzzle management ------------------------------------------------------------------
@@ -60,6 +83,8 @@ class Session:
             self.trainer = None
             self.mined = []
             self.last_result = None
+            self._clear_play()
+            self._show_phase, self._show_until, self.show_caption = "pause", time.monotonic() + 0.8, ""
             self.telemetry.set(puzzle=self.puzzle.name, facets=self.puzzle.n, actions=self.puzzle.num_actions,
                                group_order="…", macros=[])
             self.telemetry.event(f"loaded {self.puzzle.name}: {self.puzzle.spec.description}")
@@ -99,6 +124,7 @@ class Session:
         """Apply a move string such as ``"R U R' U'"``; returns the applied move names."""
         with self._lock:
             actions = self.puzzle.parse_moves(moves)
+            self.flush_play()
             state = self.state
             for a in actions:
                 state = self.puzzle.apply(state, a)
@@ -109,6 +135,7 @@ class Session:
 
     def undo(self) -> Optional[str]:
         with self._lock:
+            self.flush_play()
             if not self.history:
                 return None
             name = self.history.pop()
@@ -118,19 +145,24 @@ class Session:
 
     def reset(self) -> None:
         with self._lock:
+            self._clear_play()
             self.state = self.puzzle.identity.copy()
             self.history.clear()
             self.scramble_moves = []
 
-    def scramble(self, depth: int = 20) -> list[str]:
+    def scramble(self, depth: int = 20, seed: Optional[int] = None) -> list[str]:
+        """Scramble from the solved state; a ``seed`` makes the scramble reproducible."""
         with self._lock:
-            self.state, actions = self.puzzle.scramble(self.rng, depth)
+            self._clear_play()
+            rng = self.rng if seed is None else np.random.default_rng(seed)
+            self.state, actions = self.puzzle.scramble(rng, depth)
             self.history.clear()
             self.scramble_moves = self.puzzle.names_of(actions)
             return self.scramble_moves
 
     def set_state(self, P) -> None:
         with self._lock:
+            self._clear_play()
             self.state = np.asarray(P, dtype=np.intp).copy()
             self.history.clear()
 
@@ -158,7 +190,7 @@ class Session:
             return self._pdbs
 
     def solve(self, method: str = "auto", time_limit: float = 20.0, weight: Optional[float] = None,
-              use_model: Optional[bool] = None) -> SearchResult:
+              use_model: Optional[bool] = None, quiet: bool = False) -> SearchResult:
         """Search for a solution of the current state (does not modify it)."""
         with self._lock:
             state = self.state.copy()
@@ -166,7 +198,8 @@ class Session:
         if not self.group.contains_state(state):
             res = SearchResult(solved=False, reason="unsolvable: state is not in the puzzle group")
             self.last_result = res
-            self.telemetry.event(res.reason)
+            if not quiet:
+                self.telemetry.event(res.reason)
             return res
         self._cancel_search.clear()
         pdbs = self.pdbs()
@@ -187,10 +220,11 @@ class Session:
         self.last_result = res
         self.telemetry.set(last_solution=" ".join(res.moves) if res.solved else "", last_solution_len=len(res.moves),
                            search_nodes=res.nodes_generated)
-        self.telemetry.event(
-            (f"solved in {len(res.moves)} moves" + (" (optimal)" if res.optimal_proven else "")
-             if res.solved else f"no solution: {res.reason or 'budget'}")
-            + f" | {res.nodes_generated:,} nodes, {res.nodes_per_sec:,.0f}/s, {res.elapsed:.2f}s")
+        if not quiet:
+            self.telemetry.event(
+                (f"solved in {len(res.moves)} moves" + (" (optimal)" if res.optimal_proven else "")
+                 if res.solved else f"no solution: {res.reason or 'budget'}")
+                + f" | {res.nodes_generated:,} nodes, {res.nodes_per_sec:,.0f}/s, {res.elapsed:.2f}s")
         return res
 
     def cancel_search(self) -> None:
@@ -279,6 +313,155 @@ class Session:
     def training(self) -> bool:
         return self._train_thread is not None and self._train_thread.is_alive()
 
+    # -- timed playback ---------------------------------------------------------------------------
+    def _clear_play(self) -> None:
+        self._play_queue.clear()
+        self._play_current = None
+
+    @property
+    def playing(self) -> bool:
+        return self._play_current is not None or bool(self._play_queue)
+
+    def play(self, moves: str | list[str], move_time: Optional[float] = None) -> list[str]:
+        """Queue moves for animated playback; they are applied one by one as frames are rendered."""
+        with self._lock:
+            names = self.puzzle.names_of(self.puzzle.parse_moves(moves))
+            dur = float(move_time) if move_time else self.move_time
+            self._play_queue.extend((n, max(dur, 0.01)) for n in names)
+            return names
+
+    def flush_play(self) -> None:
+        """Apply every queued move immediately."""
+        with self._lock:
+            pending = ([self._play_current] if self._play_current else []) + list(self._play_queue)
+            self._clear_play()
+            for name, _ in pending:
+                try:
+                    self._apply_named(name)
+                except (KeyError, ValueError):
+                    break
+
+    def _apply_named(self, name: str) -> None:
+        self.state = self.puzzle.apply(self.state, self.puzzle.action_index(name))
+        self.history.append(name)
+
+    def _advance_play(self, now: float) -> Optional[tuple[str, float]]:
+        """Advance the playback clock; returns ``(move, fraction)`` of the move in progress."""
+        with self._lock:
+            while True:
+                if self._play_current is None:
+                    if not self._play_queue:
+                        return None
+                    self._play_current = self._play_queue.popleft()
+                    self._play_t0 = self._play_free_at if 0 <= now - self._play_free_at < 0.25 else now
+                name, dur = self._play_current
+                t = (now - self._play_t0) / dur
+                if t < 1.0:
+                    return name, t
+                self._play_current = None
+                self._play_free_at = self._play_t0 + dur
+                try:
+                    self._apply_named(name)
+                except (KeyError, ValueError):
+                    self._clear_play()
+                    return None
+
+    # -- idle show --------------------------------------------------------------------------------
+    def set_show(self, mode: Optional[str] = None, paused: Optional[bool] = None, depth: Optional[int] = None,
+                 pause: Optional[float] = None, move_time: Optional[float] = None,
+                 daily_depth: Optional[int] = None) -> dict:
+        """Configure what the puzzle does while idle (see :data:`SHOW_MODES`)."""
+        if mode is not None and mode not in SHOW_MODES:
+            raise ValueError(f"unknown show mode {mode!r}; choose from {', '.join(SHOW_MODES)}")
+        with self._lock:
+            if depth is not None:
+                self.show_depth = max(1, int(depth))
+            if daily_depth is not None:
+                self.show_daily_depth = max(1, int(daily_depth))
+            if pause is not None:
+                self.show_pause = max(0.0, float(pause))
+            if move_time is not None:
+                self.move_time = max(0.02, float(move_time))
+            restart = mode is not None and (mode != self.show_mode or self.show_paused)
+            if mode is not None:
+                self.show_mode = mode
+                self.show_paused = False
+            if paused is not None:
+                restart = restart or (self.show_paused and not paused)
+                self.show_paused = bool(paused)
+            if restart and not self.show_paused:
+                self._show_phase, self._show_until = "pause", time.monotonic() + 0.6
+                self.show_caption = ""
+                if self.show_mode == "daily":
+                    today = datetime.date.today()
+                    moves = self.scramble(self.show_daily_depth, seed=today.toordinal())
+                    self.show_caption = f"scramble of the day ({today:%d %b}): " + " ".join(moves)
+            return self.show_status()
+
+    def pause_show(self) -> None:
+        """Called when a human takes over the puzzle."""
+        self.show_paused = True
+
+    def show_status(self) -> dict:
+        return dict(mode=self.show_mode, paused=self.show_paused, phase=self._show_phase,
+                    caption=self.show_caption, queued=len(self._play_queue) + (self._play_current is not None))
+
+    def _show_tick(self, now: float) -> None:
+        """Attract-mode state machine, advanced whenever a frame is rendered."""
+        if self.show_mode != "attract" or self.show_paused:
+            return
+        phase = self._show_phase
+        if phase == "pause":
+            if now < self._show_until:
+                return
+            with self._lock:
+                self._clear_play()
+                self.state = self.puzzle.identity.copy()
+                _, actions = self.puzzle.scramble(self.rng, self.show_depth)
+                names = self.puzzle.names_of(actions)
+                self.history.clear()
+                self.scramble_moves = self._show_scramble = names
+                self._play_queue.extend((n, max(self.move_time * 0.55, 0.01)) for n in names)
+                self.show_caption = "scramble: " + " ".join(names)
+                self._show_phase = "scrambling"
+        elif phase == "scrambling":
+            if self.playing:
+                return
+            self._show_result = None
+
+            def work() -> None:
+                try:
+                    self._show_result = self.solve(time_limit=self.show_time_limit, quiet=True)
+                except Exception as exc:                                  # shown in the caption below
+                    self._show_result = SearchResult(solved=False, reason=f"{type(exc).__name__}: {exc}")
+
+            self._show_thread = threading.Thread(target=work, name="twisty-show", daemon=True)
+            self._show_thread.start()
+            self.show_caption = "searching …"
+            self._show_phase = "solving"
+        elif phase == "solving":
+            if self._show_thread is not None and self._show_thread.is_alive():
+                return
+            res = self._show_result
+            with self._lock:
+                if self._show_phase != "solving" or self.show_paused:
+                    return
+                if res is not None and res.solved:
+                    moves = res.moves
+                    self.show_caption = (f"solved in {len(moves)} moves" + (" (optimal)" if res.optimal_proven else "")
+                                         + f": {' '.join(moves)}  ·  {res.nodes_generated:,} nodes in {res.elapsed:.2f}s")
+                else:
+                    inv = self.puzzle.inverse
+                    moves = self.puzzle.names_of(
+                        [int(inv[self.puzzle.action_index(n)]) for n in reversed(self._show_scramble)])
+                    self.show_caption = "search budget exceeded, undoing the scramble: " + " ".join(moves)
+                self._play_queue.extend((n, self.move_time) for n in moves)
+                self._show_phase = "playing"
+        elif phase == "playing":
+            if self.playing:
+                return
+            self._show_phase, self._show_until = "pause", now + self.show_pause
+
     # -- rendering --------------------------------------------------------------------------------
     def camera_yaw(self) -> float:
         if self.spin:
@@ -298,6 +481,10 @@ class Session:
     def render(self, width: int = 48, height: int = 24, view: str = "3d",
                anim: Optional[tuple[str, float]] = None, state: Optional[np.ndarray] = None) -> Frame:
         r = get_renderer(self.puzzle)
+        if state is None and anim is None:
+            now = time.monotonic()
+            self._show_tick(now)
+            anim = self._advance_play(now)
         st = self.state if state is None else state
         if view == "net":
             return r.render_net(st, width, height)
@@ -313,5 +500,5 @@ class Session:
             model_ready=self.model is not None and self.base_puzzle.name in self.model_trained_on,
             group_order=self.telemetry.get("group_order", "…"),
             last_solution=res.moves if res is not None and res.solved else [],
-            puzzles=list_puzzles(), legal=self.legal_moves(),
+            puzzles=list_puzzles(), legal=self.legal_moves(), show=self.show_status(),
         )

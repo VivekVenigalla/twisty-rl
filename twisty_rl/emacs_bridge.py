@@ -18,7 +18,7 @@ from .puzzles import list_puzzles
 from .session import Session
 
 PROTOCOL_VERSION = "1.0"
-HEAVY = {"solve", "group_info", "mine_macros", "set_puzzle", "is_solvable", "set_colors"}
+HEAVY = {"solve", "group_info", "mine_macros", "set_puzzle", "is_solvable", "set_colors", "show"}
 
 
 def default_socket_path() -> str:
@@ -34,9 +34,10 @@ class RpcError(Exception):
 
 class TwistyDaemon:
     def __init__(self, session: Optional[Session] = None, socket_path: Optional[str] = None,
-                 puzzle: str = "cube3", device: Optional[str] = None):
+                 puzzle: str = "cube3", device: Optional[str] = None, exit_with_parent: bool = False):
         self.session = session or Session(puzzle, device)
         self.socket_path = socket_path or default_socket_path()
+        self.exit_with_parent = exit_with_parent
         self._server: Optional[asyncio.AbstractServer] = None
         self._stop: Optional[asyncio.Event] = None
         self.requests_served = 0
@@ -62,21 +63,43 @@ class TwistyDaemon:
         return self.session.status()
 
     def rpc_apply(self, moves: str | list[str]) -> dict:
+        self.session.pause_show()
         try:
             applied = self.session.apply(moves)
         except (KeyError, ValueError) as exc:
             raise RpcError(-32602, str(exc)) from None
         return {"applied": applied, "solved": self.session.is_solved()}
 
+    def rpc_play(self, moves: str | list[str], move_time: Optional[float] = None) -> dict:
+        """Queue moves for animated playback (applied as frames are rendered)."""
+        self.session.pause_show()
+        try:
+            queued = self.session.play(moves, move_time)
+        except (KeyError, ValueError) as exc:
+            raise RpcError(-32602, str(exc)) from None
+        return {"queued": queued}
+
+    def rpc_show(self, mode: Optional[str] = None, paused: Optional[bool] = None, depth: Optional[int] = None,
+                 pause: Optional[float] = None, move_time: Optional[float] = None,
+                 daily_depth: Optional[int] = None) -> dict:
+        """Idle behaviour: ``spin``, ``attract`` (scramble and solve forever) or ``daily``."""
+        try:
+            return self.session.set_show(mode, paused, depth, pause, move_time, daily_depth)
+        except ValueError as exc:
+            raise RpcError(-32602, str(exc)) from None
+
     def rpc_undo(self) -> dict:
+        self.session.pause_show()
         return {"undone": self.session.undo(), "solved": self.session.is_solved()}
 
     def rpc_reset(self) -> dict:
+        self.session.pause_show()
         self.session.reset()
         return {"solved": True}
 
-    def rpc_scramble(self, depth: int = 20) -> dict:
-        return {"scramble": self.session.scramble(int(depth))}
+    def rpc_scramble(self, depth: int = 20, seed: Optional[int] = None) -> dict:
+        self.session.pause_show()
+        return {"scramble": self.session.scramble(int(depth), None if seed is None else int(seed))}
 
     def rpc_state(self) -> dict:
         s = self.session
@@ -84,6 +107,7 @@ class TwistyDaemon:
                 "palette": [list(c) for c in s.puzzle.spec.palette]}
 
     def rpc_set_colors(self, colors: list[int]) -> dict:
+        self.session.pause_show()
         ok = self.session.set_colors(colors)
         return {"accepted": ok, "reason": "" if ok else "colouring is not reachable (parity / orientation violation)"}
 
@@ -221,11 +245,24 @@ class TwistyDaemon:
         self._stop = asyncio.Event()
         self._server = await asyncio.start_unix_server(self._handle, path=self.socket_path, limit=1 << 22)
         os.chmod(self.socket_path, 0o600)
+        watchdog = None
+        if self.exit_with_parent:
+            parent = os.getppid()
+
+            async def watch() -> None:                    # an editor that crashed must not leave us behind
+                while os.getppid() == parent:
+                    await asyncio.sleep(2.0)
+                self._stop.set()
+
+            watchdog = asyncio.create_task(watch())
         if ready is not None:
             ready()
         try:
             await self._stop.wait()
         finally:
+            if watchdog is not None:
+                watchdog.cancel()
+            self.session.cancel_search()
             self._server.close()
             await self._server.wait_closed()
             self.session.stop_training()

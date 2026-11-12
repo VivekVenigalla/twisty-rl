@@ -346,7 +346,8 @@ def cmd_tui(args) -> int:
 
 def cmd_daemon(args) -> int:
     from twisty_rl.emacs_bridge import TwistyDaemon
-    TwistyDaemon(socket_path=args.socket, puzzle=args.puzzle, device=args.device).run()
+    TwistyDaemon(socket_path=args.socket, puzzle=args.puzzle, device=args.device,
+                 exit_with_parent=args.exit_with_parent).run()
     return 0
 
 
@@ -402,7 +403,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("daemon", help="JSON-RPC daemon on a Unix socket (Emacs bridge)")
     s.add_argument("--socket", default=None); s.add_argument("--puzzle", default="cube3")
-    s.add_argument("--device", default=None); s.set_defaults(fn=cmd_daemon)
+    s.add_argument("--device", default=None)
+    s.add_argument("--exit-with-parent", action="store_true", help="shut down when the launching process dies")
+    s.set_defaults(fn=cmd_daemon)
     return p
 
 
